@@ -1,0 +1,21 @@
+# Secretos: solo viven en la máquina local y en Render
+.env
+.env.*
+!.env.example
+
+# Entornos virtuales
+.venv/
+venv/
+
+# Cachés de Python y de las herramientas
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.pylint.d/
+
+# Cobertura y resultados de pruebas
+.coverage
+.coverage.*
+htmlcov/
+test-results/

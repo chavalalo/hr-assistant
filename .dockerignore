@@ -1,0 +1,33 @@
+# Secretos: nunca entran en la imagen
+.env
+.env.*
+
+# Pruebas: no hacen falta para servir
+tests/
+e2e/
+test-results/
+
+# Cachés y artefactos de Python y de las pruebas
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.pylint.d/
+
+# Entornos virtuales
+.venv/
+venv/
+
+# Repositorio, CI, despliegue y herramientas que la imagen no usa
+.git/
+.gitignore
+.github/
+.dockerignore
+Dockerfile
+render.yaml
+scripts/
+doc/
