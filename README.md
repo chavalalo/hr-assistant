@@ -77,7 +77,22 @@ Son opcionales y no vienen en el Blueprint; si se usan, se agregan a mano en
 Render > Environment:
 
 - `CF_AIG_TOKEN`: token de AI Gateway autenticado (secreto).
-- `LANGSMITH_API_KEY`: clave de LangSmith, solo con `LANGSMITH_TRACING=true` (secreto).
+
+**Trazas en Render.** El Blueprint no trae ninguna variable de LangSmith y
+`LANGSMITH_TRACING` vale `false` por omisión: poner solo la clave no manda ninguna
+traza. Para tener trazas hay que agregar a mano en Render > Environment:
+
+- `LANGSMITH_API_KEY`: clave de LangSmith (secreto).
+- `LANGSMITH_TRACING=true`: sin ella no se traza, aunque exista la clave.
+- `LANGSMITH_PROJECT` (opcional), por ejemplo `hr-assistant`; sin ella las trazas
+  van al proyecto `default`.
+- `LANGSMITH_ENDPOINT`, solo para cuentas de la región de Europa:
+  `https://eu.api.smith.langchain.com`.
+
+`HIDE_INPUTS` y `HIDE_OUTPUTS` deben seguir en `true` (así vienen en el Blueprint):
+con `ENVIRONMENT=production` y `LANGSMITH_TRACING=true`, si alguna vale `false` el
+producto no arranca (compliance). Los cambios de variables se aplican cuando Render
+vuelve a desplegar el servicio.
 
 Render publica solo si el pipeline de CI pasa. La operación del servicio (tablero,
 prueba de carga, reporte de costo) está en [doc/operations.md](doc/operations.md); el
@@ -312,6 +327,21 @@ original nunca llega a la traza. El especialista recibe solo texto ya redactado,
 clave no se importa `langsmith` ni se abre ninguna conexión; en las pruebas el tracer
 se inyecta.
 
+Hacen falta las dos: `LANGSMITH_TRACING` vale `false` por omisión, así que con solo
+`LANGSMITH_API_KEY` no se traza nada (y sin la clave tampoco, aunque
+`LANGSMITH_TRACING=true`). Dos variables más las lee directamente la librería
+`langsmith` del entorno, no `app/config.py`:
+
+- `LANGSMITH_PROJECT` (opcional), por ejemplo `hr-assistant`; sin ella las trazas
+  van al proyecto `default`.
+- `LANGSMITH_ENDPOINT`, solo para cuentas de la región de Europa:
+  `https://eu.api.smith.langchain.com`; sin ella se usa el endpoint de Estados
+  Unidos y las trazas no aparecen en una cuenta europea.
+
+`HIDE_INPUTS` y `HIDE_OUTPUTS` deben quedar en `true`: con `ENVIRONMENT=production`
+y `LANGSMITH_TRACING=true`, si alguna vale `false` el producto no arranca
+(compliance). En Render estas variables se agregan a mano; ver «Publicar en Render».
+
 ## Variables de entorno
 
 | Variable | Por omisión | Para qué |
@@ -327,6 +357,8 @@ se inyecta.
 | `SLO_P95_MS` | `2000` | Meta de latencia p95 en milisegundos (entero mayor que 0) |
 | `LANGSMITH_TRACING` | `false` | Enciende las trazas en LangSmith (`true` o `false`) |
 | `LANGSMITH_API_KEY` | sin valor | Clave de LangSmith; sin ella no se traza ni se intenta conectar |
+| `LANGSMITH_PROJECT` | `default` | Proyecto de LangSmith, opcional (la lee `langsmith`, no la app) |
+| `LANGSMITH_ENDPOINT` | endpoint de EE. UU. | Solo cuentas de Europa: `https://eu.api.smith.langchain.com` (la lee `langsmith`) |
 | `HIDE_INPUTS` / `HIDE_OUTPUTS` | `true` | No mandar a LangSmith el texto de preguntas ni respuestas |
 | `CF_ACCOUNT_ID` | vacía | Cuenta de Cloudflare (obligatoria con `gateway`) |
 | `CF_GATEWAY_ID` | `default` | Gateway de AI Gateway (obligatorio con `gateway`) |
