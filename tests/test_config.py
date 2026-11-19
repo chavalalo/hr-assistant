@@ -96,6 +96,39 @@ def test_settings_never_show_the_cloudflare_token(gateway_environ):
     assert "tok-secret" not in repr(settings)
 
 
+def test_challenge_settings_have_safe_defaults_and_reject_invalid_values(
+    gateway_environ,
+):
+    secret = "aig-secret-value-123"
+    settings = Settings.from_env({})
+    invalid = {
+        "MAX_ANSWER_CHARS": "0",
+        "MODEL_RETRIES": "-1",
+        "MODEL_RETRY_BACKOFF_SECONDS": "pronto",
+        "MODEL_FALLBACK": "maybe",
+        "ANSWER_CACHE_TTL_SECONDS": "-5",
+        "ANSWER_CACHE_MAX_ENTRIES": "0",
+        "METRICS_CLIENTS": "ops,bad name!",
+    }
+
+    assert settings.max_answer_chars == 1500
+    assert settings.model_retries == 2
+    assert settings.model_retry_backoff_seconds == 0.5
+    assert settings.model_fallback is True
+    assert settings.answer_cache_ttl_seconds == 0
+    assert settings.answer_cache_max_entries == 256
+    assert len(settings.metrics_clients) == 0
+    expected = (PRODUCT / "data" / "policies.json").resolve()
+    assert Path(settings.policies_path).resolve() == expected
+    for name, value in invalid.items():
+        with pytest.raises(ConfigError, match=name) as error:
+            Settings.from_env({name: value, "CF_AIG_TOKEN": secret})
+        assert secret not in str(error.value)
+    fake_outside_fake = dict(gateway_environ, FAKE_UNAVAILABLE_MODELS="x")
+    with pytest.raises(ConfigError, match="FAKE_UNAVAILABLE_MODELS"):
+        Settings.from_env(fake_outside_fake)
+
+
 def test_invalid_cost_settings_prevent_startup():
     invalid = {
         "HISTORY_WINDOW": "-1",

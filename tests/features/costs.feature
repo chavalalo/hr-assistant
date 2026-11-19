@@ -29,7 +29,8 @@ Feature: Cheaper answers without worse answers
   Scenario: Only the last messages of the history reach the model
     Given the priced HR assistant is running with a spy model and a history window of 2
     When I ask "Hola" after a history of 4 messages
-    Then the model received only the last 2 history messages and the question
+    Then the supervisor classified only the question, without the history
+    And the model received only the last 2 history messages and the question
     And the agent_run line says 2 history messages were sent
 
   Scenario: When the gateway fails the API answers 502 with the request id
@@ -43,5 +44,5 @@ Feature: Cheaper answers without worse answers
     Given the HR assistant uses a gateway that answers from its cache
     When I ask "Hola" with the request id "cost-cache"
     Then the response status is 200
-    And the answer has 1 cached call and costs 0
-    And the answer still reports the tokens of the gateway
+    And the answer has 2 cached calls and costs 0
+    And the answer still reports the tokens of both gateway calls

@@ -63,6 +63,33 @@ def _tracing_violations(settings):
     return found
 
 
+def _metrics_clients_violations(settings):
+    """Revisa que ``METRICS_CLIENTS`` nombre solo clientes de ``API_KEYS``.
+
+    Vacía en producción dejaría ``/metrics`` abierto a todos los clientes.
+    El mensaje dice la posición de las entradas, nunca nombres ni claves.
+
+    :param settings: Configuración de la aplicación
+    :type settings: app.config.Settings
+    :return: Reglas que fallan
+    :rtype: list[str]
+    """
+    if not settings.metrics_clients:
+        return ["METRICS_CLIENTS must name at least one client in production"]
+    known = {client.name for client in settings.api_clients}
+    unknown = [
+        str(position)
+        for position, name in enumerate(settings.metrics_clients, start=1)
+        if name not in known
+    ]
+    if unknown:
+        return [
+            f"METRICS_CLIENTS entries {', '.join(unknown)} must be clients "
+            "of API_KEYS in production"
+        ]
+    return []
+
+
 def violations(settings):
     """Lista las reglas de producción que la configuración no cumple.
 
@@ -79,6 +106,7 @@ def violations(settings):
         _model_violations(settings)
         + _api_key_violations(settings)
         + _tracing_violations(settings)
+        + _metrics_clients_violations(settings)
     )
 
 

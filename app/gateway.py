@@ -11,6 +11,7 @@ import re
 import httpx
 
 from app.completion import Completion
+from app.prompts import DIRECTORY_PROMPT
 
 GATEWAY_URL = (
     "https://gateway.ai.cloudflare.com/v1/{account}/{gateway}"
@@ -20,21 +21,45 @@ GATEWAY_TIMEOUT_SECONDS = 30
 CACHE_TTL_HEADER = "cf-aig-cache-ttl"
 CACHE_STATUS_HEADER = "cf-aig-cache-status"
 CACHE_HIT = "HIT"
+AIG_AUTH_HEADER = "cf-aig-authorization"
 CODE_FENCE_PATTERN = re.compile(r"^```[A-Za-z]*\s*(.*?)\s*```$", re.DOTALL)
-SYSTEM_PROMPT = (
-    "Eres el asistente de Recursos Humanos. Responde siempre con un solo objeto "
-    "JSON y nada más. Para consultar el directorio pide una herramienta: "
-    '{"tool": "get_employee", "args": {"employee_id": "EMP-0004"}} o '
-    '{"tool": "search_by_department", "args": {"department": "Finanzas"}}. '
-    "El resultado llega en un mensaje que empieza con "
-    '"Resultado de la herramienta: ". Cuando tengas la respuesta, contesta '
-    '{"answer": "<respuesta breve en español>"}. No inventes datos: usa solo lo '
-    "que devuelven las herramientas."
-)
+SYSTEM_ROLE = "system"
+# Prompt por omisión: el del especialista de directorio (sesiones 1 a 4).
+SYSTEM_PROMPT = DIRECTORY_PROMPT
+
+
+TOO_MANY_REQUESTS_STATUS = 429
+SERVER_ERROR_STATUS = 500
 
 
 class ModelUnavailable(RuntimeError):
-    """El gateway no respondió o su respuesta no se pudo usar."""
+    """El gateway no respondió o su respuesta no se pudo usar.
+
+    :param message: Mensaje fijo, sin URL, cuerpo ni token
+    :type message: str
+    :param retryable: ``True`` si vale la pena reintentar (timeout, 429 o 5xx)
+    :type retryable: bool
+    """
+
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _is_retryable(error):
+    """Decide si un error HTTP del gateway merece un reintento.
+
+    :param error: Error de ``httpx``
+    :type error: httpx.HTTPError
+    :return: ``True`` ante timeout, ``429`` o ``5xx``
+    :rtype: bool
+    """
+    if isinstance(error, httpx.TimeoutException):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return status == TOO_MANY_REQUESTS_STATUS or status >= SERVER_ERROR_STATUS
+    return False
 
 
 def _as_json_text(content):
@@ -103,12 +128,17 @@ class GatewayModel:  # pylint: disable=too-few-public-methods
         )
 
     def _headers(self):
-        """Arma los encabezados: token y, si aplica, la vida de la caché.
+        """Arma los encabezados: token, ``CF_AIG_TOKEN`` y vida de la caché.
+
+        ``cf-aig-authorization`` solo va si ``CF_AIG_TOKEN`` tiene valor.
 
         :return: Encabezados de la petición
         :rtype: dict
         """
         headers = {"Authorization": f"Bearer {self._settings.cf_api_token}"}
+        if self._settings.cf_aig_token:
+            # Gateway autenticado: el token solo viaja en este encabezado.
+            headers[AIG_AUTH_HEADER] = f"Bearer {self._settings.cf_aig_token}"
         if self._settings.cache_ttl_seconds > 0:
             headers[CACHE_TTL_HEADER] = str(self._settings.cache_ttl_seconds)
         return headers
@@ -116,12 +146,18 @@ class GatewayModel:  # pylint: disable=too-few-public-methods
     def _body(self, messages):
         """Arma el cuerpo con el prompt de sistema primero.
 
+        Si el primer mensaje ya es de ``system`` (supervisor o especialista de
+        políticas), se usa ese en lugar del prompt por omisión.
+
         :param messages: Mensajes con ``role`` y ``content``
         :type messages: Sequence[dict]
         :return: Cuerpo de la petición
         :rtype: dict
         """
-        conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+        has_system = bool(messages) and messages[0]["role"] == SYSTEM_ROLE
+        conversation = (
+            [] if has_system else [{"role": SYSTEM_ROLE, "content": SYSTEM_PROMPT}]
+        )
         conversation.extend(
             {"role": message["role"], "content": message["content"]}
             for message in messages
@@ -141,7 +177,7 @@ class GatewayModel:  # pylint: disable=too-few-public-methods
         :return: Respuesta con tokens reales y si vino de la caché
         :rtype: app.completion.Completion
         :raises ModelUnavailable: Ante error de red, estado no 2xx o respuesta
-            sin el formato esperado
+            sin el formato esperado; ``retryable`` indica timeout, 429 o 5xx
         """
         try:
             response = self._client.post(
@@ -152,9 +188,11 @@ class GatewayModel:  # pylint: disable=too-few-public-methods
             )
             response.raise_for_status()
             content, input_tokens, output_tokens = _read_body(response.json())
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
             # Sin el error original: su texto puede traer la URL con la cuenta.
-            raise ModelUnavailable("the model gateway request failed") from None
+            raise ModelUnavailable(
+                "the model gateway request failed", retryable=_is_retryable(error)
+            ) from None
         except (KeyError, IndexError, TypeError, ValueError):
             raise ModelUnavailable(
                 "the model gateway returned an invalid response"

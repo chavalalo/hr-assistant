@@ -45,6 +45,19 @@ def no_tools_used(response):
     assert response.json()["tools_used"] == []
 
 
+@then(
+    parsers.parse(
+        'the model classified the question for the "{specialist}" specialist'
+    )
+)
+def model_classified_question(response, specialist):
+    """Sin regla que aplique, el supervisor le pregunta al modelo pequeño."""
+    body = response.json()
+    assert body["supervisor_route"] == "model"
+    assert body["specialist"] == specialist
+    assert body["agents"] == ["guard", "supervisor", specialist, "reviewer"]
+
+
 @then(parsers.parse("the agent took {steps:d} steps"))
 def agent_took_steps(response, steps):
     """Cantidad de llamadas al modelo en la petición."""

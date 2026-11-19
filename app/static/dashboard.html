@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HR Assistant - Tablero</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 0 auto;
+      max-width: 960px;
+      padding: 1rem;
+      color: #222;
+    }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1rem; margin: 0 0 0.5rem 0; }
+    .key-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 1rem; }
+    .key-row input { flex: 1; padding: 0.5rem; }
+    .status { min-height: 1.5rem; margin-bottom: 1rem; }
+    .status.error { color: #8a1c1c; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .card { border: 1px solid #ccc; border-radius: 6px; padding: 0.75rem; }
+    .value { font-size: 1.1rem; }
+    .detail { font-size: 0.85rem; color: #555; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #ddd; padding: 0.25rem 0.5rem; text-align: left; }
+  </style>
+</head>
+<body>
+  <main data-testid="dashboard">
+    <h1>HR Assistant - Tablero</h1>
+    <div class="key-row">
+      <label for="dashboard-key">Clave de acceso</label>
+      <input id="dashboard-key" data-testid="dashboard-key" type="password"
+             placeholder="Escribe tu clave y pulsa Enter" autocomplete="off">
+    </div>
+    <p id="dashboard-status" class="status" data-testid="dashboard-status"
+       role="status" aria-live="polite">Escribe tu clave para ver las métricas.</p>
+
+    <div class="cards">
+      <section class="card" data-testid="dashboard-requests">
+        <h2>Peticiones</h2>
+        <div class="value" id="requests-value">-</div>
+      </section>
+      <section class="card" data-testid="dashboard-error-rate">
+        <h2>Tasa de error (5xx)</h2>
+        <div class="value" id="error-rate-value">-</div>
+      </section>
+      <section class="card" data-testid="dashboard-p95">
+        <h2>Latencia contra el SLO</h2>
+        <div class="value" id="p95-value">-</div>
+        <div class="detail" id="p50-value"></div>
+      </section>
+      <section class="card" data-testid="dashboard-cost">
+        <h2>Costo</h2>
+        <div class="value" id="cost-value">-</div>
+        <div class="detail" id="cost-per-answer-value"></div>
+      </section>
+      <section class="card" data-testid="dashboard-cache-hit-rate">
+        <h2>Aciertos de la caché</h2>
+        <div class="value" id="cache-value">-</div>
+        <div class="detail" id="cache-detail"></div>
+      </section>
+      <section class="card" data-testid="dashboard-supervisor">
+        <h2>Supervisor y respaldo</h2>
+        <div class="value" id="supervisor-value">-</div>
+        <div class="detail" id="fallbacks-value"></div>
+      </section>
+    </div>
+
+    <section class="card" data-testid="dashboard-specialists">
+      <h2>Por especialista</h2>
+      <table>
+        <thead>
+          <tr><th>Especialista</th><th>Respuestas</th><th>Costo (USD)</th></tr>
+        </thead>
+        <tbody id="specialists-body"></tbody>
+      </table>
+    </section>
+
+    <section class="card" data-testid="dashboard-clients">
+      <h2>Por cliente</h2>
+      <table>
+        <thead>
+          <tr><th>Cliente</th><th>Respuestas</th><th>Costo (USD)</th></tr>
+        </thead>
+        <tbody id="clients-body"></tbody>
+      </table>
+    </section>
+
+    <section class="card" data-testid="dashboard-security">
+      <h2>Seguridad</h2>
+      <table>
+        <tbody id="security-body"></tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    // El HTML no trae datos: todo sale de /metrics con la clave de la persona.
+    // La clave vive solo en sessionStorage (misma llave que la página
+    // principal) y se borra al cerrar la pestaña.
+    const KEY_STORAGE_NAME = "hr-assistant-api-key";
+    const REFRESH_MILLISECONDS = 10000;
+    const COST_DIGITS = 6;
+    const SECURITY_LABELS = {
+      blocked_inputs: "Entradas bloqueadas",
+      pii_redactions: "Datos personales ocultados",
+      output_blocked: "Respuestas bloqueadas",
+      access_denied: "Accesos denegados"
+    };
+    const keyInput = document.getElementById("dashboard-key");
+    const statusLine = document.getElementById("dashboard-status");
+
+    function setText(id, text) {
+      document.getElementById(id).textContent = text;
+    }
+
+    function percent(rate) {
+      return (rate * 100).toFixed(1) + " %";
+    }
+
+    function usd(amount) {
+      return amount.toFixed(COST_DIGITS) + " USD";
+    }
+
+    function showStatus(text, isError) {
+      statusLine.textContent = text;
+      statusLine.className = isError ? "status error" : "status";
+    }
+
+    // Llena una tabla solo con createElement y textContent.
+    function fillRows(bodyId, rows) {
+      const body = document.getElementById(bodyId);
+      body.replaceChildren();
+      rows.forEach(function (cells) {
+        const row = document.createElement("tr");
+        cells.forEach(function (cell) {
+          const column = document.createElement("td");
+          column.textContent = String(cell);
+          row.appendChild(column);
+        });
+        body.appendChild(row);
+      });
+    }
+
+    function tallyRows(tallies) {
+      return Object.keys(tallies).sort().map(function (name) {
+        const tally = tallies[name];
+        return [name, tally.requests, tally.cost_usd.toFixed(COST_DIGITS)];
+      });
+    }
+
+    function render(metrics) {
+      const answers = Object.values(metrics.by_specialist).reduce(
+        function (total, tally) { return total + tally.requests; }, 0
+      );
+      const latency = metrics.latency_ms;
+      const slo = metrics.slo;
+      setText("requests-value", String(metrics.requests));
+      setText("error-rate-value", percent(metrics.error_rate));
+      setText("p95-value", "p95 " + latency.p95 + " ms / SLO " +
+        slo.p95_ms_target + " ms (" + (slo.met ? "se cumple" : "no se cumple") + ")");
+      setText("p50-value", "p50 " + latency.p50 + " ms");
+      setText("cost-value", "Total " + usd(metrics.cost_usd));
+      setText("cost-per-answer-value", "Por respuesta " +
+        usd(answers ? metrics.cost_usd / answers : 0));
+      setText("cache-value", percent(metrics.cache.hit_rate));
+      setText("cache-detail", "Aciertos " + metrics.cache.hits +
+        ", fallos " + metrics.cache.misses);
+      setText("supervisor-value", "Regla " + metrics.supervisor.rule +
+        ", modelo " + metrics.supervisor.model);
+      setText("fallbacks-value", "Respuestas del modelo de respaldo: " +
+        metrics.fallbacks);
+      fillRows("specialists-body", tallyRows(metrics.by_specialist));
+      fillRows("clients-body", tallyRows(metrics.by_client));
+      fillRows("security-body", Object.keys(SECURITY_LABELS).map(function (name) {
+        return [SECURITY_LABELS[name], metrics.security[name]];
+      }));
+    }
+
+    function errorMessage(status) {
+      if (status === 401) {
+        return "Clave inválida";
+      }
+      if (status === 403) {
+        return "Sin permiso para ver métricas";
+      }
+      if (status === 429) {
+        return "Demasiadas peticiones; el tablero lo intentará de nuevo.";
+      }
+      return "No se pudieron leer las métricas. Se intentará de nuevo.";
+    }
+
+    async function loadMetrics() {
+      const apiKey = sessionStorage.getItem(KEY_STORAGE_NAME) || "";
+      if (!apiKey) {
+        showStatus("Escribe tu clave para ver las métricas.", false);
+        return;
+      }
+      try {
+        const response = await fetch("/metrics", {
+          headers: { "X-API-Key": apiKey },
+          cache: "no-store"
+        });
+        if (!response.ok) {
+          showStatus(errorMessage(response.status), true);
+          return;
+        }
+        render(await response.json());
+        showStatus("Actualizado a las " + new Date().toLocaleTimeString(), false);
+      } catch (error) {
+        showStatus(errorMessage(0), true);
+      }
+    }
+
+    function saveKeyAndLoad() {
+      sessionStorage.setItem(KEY_STORAGE_NAME, keyInput.value.trim());
+      loadMetrics();
+    }
+
+    keyInput.value = sessionStorage.getItem(KEY_STORAGE_NAME) || "";
+    keyInput.addEventListener("change", saveKeyAndLoad);
+    keyInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        saveKeyAndLoad();
+      }
+    });
+    loadMetrics();
+    setInterval(loadMetrics, REFRESH_MILLISECONDS);
+  </script>
+</body>
+</html>

@@ -26,6 +26,13 @@ class Clock(Protocol):
         :rtype: float
         """
 
+    def sleep(self, seconds: float) -> None:
+        """Espera los segundos dados (la espera entre reintentos del modelo).
+
+        :param seconds: Segundos que espera
+        :type seconds: float
+        """
+
 
 class SystemClock:
     """Reloj real basado en la hora del sistema."""
@@ -45,6 +52,14 @@ class SystemClock:
         :rtype: float
         """
         return time.monotonic()
+
+    def sleep(self, seconds):
+        """Duerme el hilo actual.
+
+        :param seconds: Segundos que espera
+        :type seconds: float
+        """
+        time.sleep(seconds)
 
 
 class FixedClock:
@@ -83,3 +98,11 @@ class FixedClock:
         :type seconds: float
         """
         self._elapsed += seconds
+
+    def sleep(self, seconds):
+        """Simula una espera: solo avanza el reloj, nunca duerme.
+
+        :param seconds: Segundos que avanza
+        :type seconds: float
+        """
+        self.advance(seconds)

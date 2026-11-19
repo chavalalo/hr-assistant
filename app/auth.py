@@ -117,3 +117,20 @@ def identify_client(header_value, clients):
         if hmac.compare_digest(received, client.key.encode("utf-8")):
             found = client.name
     return found
+
+
+def can_read_metrics(client, metrics_clients):
+    """Decide si un cliente ya identificado puede leer ``GET /metrics``.
+
+    Compara nombres de cliente, no claves: la clave ya se revisó antes.
+
+    :param client: Nombre del cliente
+    :type client: str
+    :param metrics_clients: Clientes de ``METRICS_CLIENTS``; vacía: todos
+    :type metrics_clients: tuple[str, ...]
+    :return: ``True`` si puede leer las métricas
+    :rtype: bool
+    """
+    if not metrics_clients:
+        return True
+    return client in metrics_clients

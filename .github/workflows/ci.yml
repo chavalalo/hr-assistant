@@ -1,4 +1,5 @@
-# Pipeline de CI del HR Assistant (spec/04-production.md, punto 6).
+# Pipeline de CI del HR Assistant (spec/04-production.md, punto 6, y
+# spec/05-reto.md, punto 9).
 # Cuatro etapas encadenadas: si una falla, las siguientes no corren y Render no
 # publica (autoDeployTrigger: checksPass).
 name: CI
@@ -25,13 +26,11 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Instalar dependencias
-        run: |
-          pip install -r requirements.txt
-          # pylint todavía no está en requirements.txt
-          pip install pylint
+        run: pip install -r requirements.txt
       - name: pylint
+        # Los scripts de despliegue (smoke, carga, costos) también se revisan
         run: >-
-          python -m pylint app tests --max-line-length=88 --fail-under=10
+          python -m pylint app tests scripts --max-line-length=88 --fail-under=10
           --disable=missing-function-docstring,redefined-outer-name,too-few-public-methods
 
   unit:
@@ -50,7 +49,7 @@ jobs:
         run: python -m pytest tests -q -p no:cacheprovider --cov=app --cov-fail-under=80
 
   e2e:
-    name: e2e (Playwright, modelo simulado)
+    name: e2e (Playwright y carga, modelo simulado)
     needs: unit
     runs-on: ubuntu-latest
     env:
@@ -58,6 +57,9 @@ jobs:
       MODEL_PROVIDER: fake
       API_KEYS: ci:ci-example-key-0123456789
       E2E_API_KEY: ci-example-key-0123456789
+      # La prueba de carga usa la misma clave de ejemplo
+      SMOKE_API_KEY: ci-example-key-0123456789
+      # Límite alto para que la carga no choque con el 429
       RATE_LIMIT_PER_MINUTE: "1000"
       BASE_URL: http://127.0.0.1:8000
     steps:
@@ -67,10 +69,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Instalar dependencias
-        run: |
-          pip install -r requirements.txt
-          # pytest-playwright todavía no está en requirements.txt
-          pip install pytest-playwright
+        run: pip install -r requirements.txt
       - name: Instalar Chromium
         run: python -m playwright install --with-deps chromium
       - name: Arrancar el producto
@@ -84,6 +83,10 @@ jobs:
           exit 1
       - name: Pruebas de punta a punta
         run: python -m pytest e2e -q -p no:cacheprovider --base-url "$BASE_URL"
+      - name: Prueba de carga (60 peticiones, 10 hilos)
+        run: python scripts/load_test.py "$BASE_URL"
+      - name: Reporte de costos del log
+        run: python scripts/cost_report.py uvicorn.log
       - name: Log del producto si algo falla
         if: failure()
         run: cat uvicorn.log

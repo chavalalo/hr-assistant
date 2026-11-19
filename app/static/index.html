@@ -38,10 +38,15 @@
     <input id="api-key" data-testid="api-key" type="password"
            placeholder="Escribe tu clave" autocomplete="off">
   </div>
+  <p class="help" data-testid="help">
+    Pregunta por un empleado (EMP-0001), un departamento o una de las políticas de
+    RH (vacaciones, home office...). No escribas datos personales: se ocultan antes
+    de llegar al modelo.
+  </p>
   <div id="conversation" data-testid="answer" aria-live="polite"></div>
   <form id="ask-form">
     <input id="question" data-testid="question" type="text"
-           placeholder="Pregunta por un empleado (EMP-0001) o un departamento"
+           placeholder="Pregunta por un empleado, un departamento o una política"
            autocomplete="off">
     <button id="send" data-testid="send" type="submit">Enviar</button>
   </form>
@@ -67,6 +72,10 @@
       const turn = document.createElement("div");
       turn.className = "turn " + kind;
       const body = document.createElement("div");
+      if (kind === "assistant") {
+        // Cada vuelta del asistente se ubica por este data-testid.
+        body.setAttribute("data-testid", "assistant-answer");
+      }
       body.textContent = text;
       turn.appendChild(body);
       if (tools !== undefined) {
@@ -107,6 +116,10 @@
     function errorMessage(error) {
       if (error.status === 401) {
         return "Clave inválida";
+      }
+      if (error.status === 400) {
+        return "La pregunta fue bloqueada por la política de entrada. " +
+          "Pregunta por un empleado, un departamento o una política.";
       }
       if (error.status === 429) {
         const seconds = parseInt(error.retryAfter, 10);

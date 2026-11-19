@@ -25,6 +25,7 @@ PRODUCTION_BASE = {
     "CF_GATEWAY_ID": "hr-gw",
     "CF_API_TOKEN": "tok-secret",
     "API_KEYS": f"ops:{LONG_KEY}",
+    "METRICS_CLIENTS": "ops",
     "HIDE_INPUTS": "true",
     "HIDE_OUTPUTS": "true",
 }
