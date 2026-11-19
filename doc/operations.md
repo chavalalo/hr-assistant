@@ -106,15 +106,18 @@ Antes de correrla contra Render:
 ### Evidencia local
 
 `uv run python -m verification load` arranca el producto con el modelo simulado y manda 60
-peticiones con 10 hilos; pasa si todas responden `200`:
+peticiones con 10 hilos; pasa si todas responden `200`. Medición después de la corrección 2
+(políticas ancladas al texto):
 
 ```text
-requests=60 concurrency=10 ok=60 p50_ms=21.0 p95_ms=28.4 rps=445.4
+requests=60 concurrency=10 ok=60 p50_ms=18.1 p95_ms=25.3 rps=483.7
 ```
 
-60 de 60 respuestas `200`, p50 de 21.0 ms y p95 de 28.4 ms (muy por debajo de `SLO_P95_MS` =
-2000), 445.4 peticiones por segundo. Con el modelo simulado no hay red: la latencia real la pone
-Workers AI y se mide con `scripts/load_test.py` contra Render.
+60 de 60 respuestas `200`, p50 de 18.1 ms y p95 de 25.3 ms (muy por debajo de `SLO_P95_MS` =
+2000), 483.7 peticiones por segundo. La medición anterior era `p50_ms=21.0 p95_ms=28.4
+rps=445.4`: las preguntas de políticas hacen ahora una llamada menos al modelo porque la
+política llega en código (ver [costos](costs.md)). Con el modelo simulado no hay red: la
+latencia real la pone Workers AI y se mide con `scripts/load_test.py` contra Render.
 
 ## Evidencia de producción (2026-11-19)
 
@@ -144,6 +147,18 @@ Se usan 25 peticiones para quedar bajo el límite de 30 por minuto por cliente
 (`ANSWER_CACHE_TTL_SECONDS=300`): las cinco preguntas de `load_test.py` se repiten y, después de
 la primera vez, salen de la caché. La p95 corresponde a las llamadas reales a Workers AI (fallos
 de caché); queda por encima de `SLO_P95_MS` = 2000 en esta medición, con una muestra pequeña.
+
+**Hallazgo: «5 días» de vacaciones.** Con el modelo real, a «Soy [EMAIL], ¿cuántos días de
+vacaciones tengo?» el especialista `policy` respondió «5 días» sin pedir `search_policy`; la
+política dice 12 días hábiles. El revisor de entonces solo anclaba ids `EMP-dddd`, así que la
+cifra inventada llegó a la persona. Lo corrigió la **corrección 2** (adenda 2 del punto 3 de
+`spec/05-reto.md`, «Políticas ancladas al texto»): con `rule:policy` la política se inyecta en
+código antes de llamar al modelo, y el revisor reemplaza toda respuesta de `policy` con una
+cifra que no está en las políticas consultadas (control C12 de [seguridad](security.md),
+ADR [0014](adr/0014-guard-and-reviewer-in-code.md)). El caso queda como prueba de regresión en
+`tests/features/policy_grounding.feature`. Tras el próximo despliegue, repite esa pregunta
+contra Render y comprueba que la respuesta diga 12 días y que `tools_used` incluya
+`search_policy`.
 
 **Traza en LangSmith.** Un `POST /ask` de directorio dejó el run raíz `request` (0.86 s) con este
 árbol:
@@ -233,6 +248,7 @@ las llamadas al modelo (`model.complete`) y las herramientas (`get_employee`,
 | --- | --- | --- |
 | `502 {"detail": "model unavailable"}` | Ningún modelo contestó: el elegido falló tras `MODEL_RETRIES` reintentos (solo timeout, `429` o `5xx`) y el de respaldo también, o el error no era reintentable. | En el log, una línea `error` con `error_type: ModelUnavailable` y el `request_id`. Revisa el estado de Cloudflare y la cuota de Workers AI; que `CF_ACCOUNT_ID`, `CF_GATEWAY_ID` y `CF_API_TOKEN` sean correctos y el token siga vigente; si el gateway es autenticado, que `CF_AIG_TOKEN` exista y sea válido (sin él el gateway rechaza todas las llamadas). `/ready` puede seguir en `200`: no llama al modelo. |
 | Muchas respuestas con `fallback: true` | El modelo elegido por el enrutador está caído y contesta el otro (`MODEL_SMALL` <-> `MODEL_LARGE`). | `fallbacks` en `/metrics` y en el tablero; `fallback` y `model` en `agent_run`. Si el que falla es `MODEL_LARGE`, la calidad de las preguntas complejas puede bajar; si es `MODEL_SMALL`, el costo sube. Revisa el modelo en Cloudflare; si la caída es larga, cambia `MODEL_SMALL` o `MODEL_LARGE` por otro modelo con precio en `data/model_prices.json` (requiere commit si el precio no existe). Las respuestas de respaldo no entran a la caché. |
+| Respuestas de políticas que son el texto completo de la política, o «No pude verificar la respuesta con las políticas. Intenta de nuevo.» | El revisor encontró una cifra que no está en las políticas consultadas y reemplazó la respuesta del modelo (control C12). | `audit` `output_blocked` con `reason: ungrounded_policy_number` y el contador `security.output_blocked`. Si sube mucho, el modelo está inventando cifras: revisa el modelo de `policy` y las preguntas con ruta `model` (sin consulta en código). Un caso aislado puede ser una cifra que la persona escribió en su pregunta. |
 | `429 {"detail": "rate limit exceeded"}` | Ese cliente pasó `RATE_LIMIT_PER_MINUTE` en 60 s. | Línea `rate_limited` con `client` y `retry_after`; el encabezado `Retry-After` dice cuántos segundos esperar. Si el uso es legítimo, sube `RATE_LIMIT_PER_MINUTE` en Render > Environment o da a ese consumidor su propio cliente en `API_KEYS`. Si no, revoca su clave (quítala de `API_KEYS`). |
 | `403 {"detail": "forbidden"}` en `/metrics` o «Sin permiso para ver métricas» en el tablero | La clave es válida pero el cliente no está en `METRICS_CLIENTS`. | `audit` `access_denied` con `path` y `client`; contador `security.access_denied`. Si debe ver las métricas, agrega su nombre (no su clave) a `METRICS_CLIENTS` en Render > Environment; el nombre debe existir en `API_KEYS` o el servicio no arranca. |
 | `401` | Falta la clave o no coincide. | `auth_rejected` con `reason` `missing` o `invalid`. Comprueba la clave del consumidor contra `API_KEYS`. |

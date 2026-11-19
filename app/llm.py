@@ -55,6 +55,22 @@ def _system_prompt(messages):
     return None
 
 
+def _tool_result(messages):
+    """Devuelve el último resultado de herramienta de la conversación.
+
+    :param messages: Mensajes con ``role`` y ``content``
+    :type messages: Sequence[dict]
+    :return: Contenido del último mensaje que empieza con
+        ``TOOL_RESULT_PREFIX`` o ``None`` si no hay ninguno
+    :rtype: str or None
+    """
+    for message in reversed(messages):
+        content = str(message.get("content", ""))
+        if content.startswith(TOOL_RESULT_PREFIX):
+            return content
+    return None
+
+
 def count_words(text):
     """Cuenta palabras separadas por espacios, como aproximación de tokens.
 
@@ -102,6 +118,9 @@ class FakeModel:
         system = _system_prompt(messages)
         if system == SUPERVISOR_PROMPT:
             decision = self._classify(last)
+        elif system == POLICY_PROMPT and _tool_result(messages):
+            # La política ya llegó en código: responde con ella sin pedirla.
+            decision = self._decide(_tool_result(messages), POLICY_ANSWER_PREFIX)
         else:
             prefix = POLICY_ANSWER_PREFIX if system == POLICY_PROMPT else ANSWER_PREFIX
             decision = self._decide(last, prefix)
