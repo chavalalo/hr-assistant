@@ -25,7 +25,9 @@ Ver también: [arquitectura](architecture.md), [seguridad](security.md), [costos
 
 Valores fijos que pone el Blueprint: `ENVIRONMENT=production`, `MODEL_PROVIDER=gateway`,
 `HIDE_INPUTS=true`, `HIDE_OUTPUTS=true` y `ANSWER_CACHE_TTL_SECONDS=300`. El resto toma su valor
-por omisión (tabla de configuración en [architecture.md](architecture.md)).
+por omisión (tabla de configuración en [architecture.md](architecture.md)). En particular,
+`LANGSMITH_TRACING` vale `false` por omisión (`app/config.py`) y `render.yaml` no la define: sin
+agregarla a mano no hay trazas, aunque exista `LANGSMITH_API_KEY`.
 
 El servicio corre con un solo worker: el límite por cliente, las métricas y la caché de
 respuestas viven en la memoria del proceso (ADR 0005 y 0015). Se pierden en cada despliegue o
@@ -42,7 +44,10 @@ Ningún secreto va en el repositorio ni en `render.yaml`.
 | `CF_API_TOKEN` | sí (`sync: false`) | Token de Cloudflare con permiso de Workers AI. Secreto. |
 | `METRICS_CLIENTS` | sí (`sync: false`) | Nombres de clientes de `API_KEYS` que pueden leer `/metrics` y el tablero, separados por coma (por ejemplo `ops`). Vacía o con un nombre que no está en `API_KEYS`: no arranca. |
 | `CF_AIG_TOKEN` | no | Solo si el gateway de AI Gateway es autenticado; va en `cf-aig-authorization`. Secreto. No está en el Blueprint: se agrega a mano. |
-| `LANGSMITH_API_KEY` | no | Clave de LangSmith; se usa junto con `LANGSMITH_TRACING=true`. Secreto. No está en el Blueprint: se agrega a mano. |
+| `LANGSMITH_API_KEY` | no (para trazas, sí) | Clave de LangSmith. Secreto. No está en el Blueprint: se agrega a mano. Sola no enciende nada: hace falta también `LANGSMITH_TRACING=true`. |
+| `LANGSMITH_TRACING` | no (para trazas, sí) | `true` para encender las trazas. Por omisión `false` y no está en el Blueprint: se agrega a mano. Solo acepta `true` o `false`; otro valor impide arrancar. |
+| `LANGSMITH_PROJECT` | no | Nombre del proyecto de LangSmith donde caen las trazas. Sin ella van al proyecto `default`. La lee la librería `langsmith` del entorno. |
+| `LANGSMITH_ENDPOINT` | no | Solo si la cuenta de LangSmith es de la región de Europa: `https://eu.api.smith.langchain.com`. Sin ella se usa la región de Estados Unidos. La lee la librería `langsmith` del entorno. |
 
 `CF_GATEWAY_ID` vale `default` si no se escribe; si el gateway tiene otro nombre, se agrega
 también. Cambiar una variable en Render reinicia el servicio.
@@ -82,7 +87,7 @@ la clave; los `429` se reportan pero no hacen fallar.
 ```bash
 cd product
 read -rs SMOKE_API_KEY && export SMOKE_API_KEY
-python scripts/load_test.py https://<tu-servicio>.onrender.com --requests 60 --concurrency 10
+python scripts/load_test.py https://<tu-servicio>.onrender.com --requests 25 --concurrency 5
 ```
 
 Antes de correrla contra Render:
@@ -90,7 +95,8 @@ Antes de correrla contra Render:
 - **Límite por minuto.** Con `RATE_LIMIT_PER_MINUTE` en 30 (por omisión), 60 peticiones de un
   mismo cliente dan unos 30 `429`. Usa un cliente dedicado a la carga y, si quieres que todas
   sean `200`, sube el límite de forma temporal en Render > Environment (y bájalo al terminar), o
-  manda menos de 30 peticiones por minuto.
+  manda menos de 30 peticiones por minuto (por ejemplo `--requests 25`, como en la evidencia de
+  producción).
 - **Cuota y caché.** Con el modelo real cada fallo de caché gasta cuota de Workers AI. Como las
   preguntas se repiten y `ANSWER_CACHE_TTL_SECONDS=300`, casi todas salen de la caché: el
   `costo_total_usd` de la carga no representa el costo de preguntas distintas.
@@ -109,6 +115,52 @@ requests=60 concurrency=10 ok=60 p50_ms=21.0 p95_ms=28.4 rps=445.4
 60 de 60 respuestas `200`, p50 de 21.0 ms y p95 de 28.4 ms (muy por debajo de `SLO_P95_MS` =
 2000), 445.4 peticiones por segundo. Con el modelo simulado no hay red: la latencia real la pone
 Workers AI y se mide con `scripts/load_test.py` contra Render.
+
+## Evidencia de producción (2026-11-19)
+
+Contra `https://hr-assistant-1q29.onrender.com`, con el modelo real (`MODEL_PROVIDER=gateway`).
+
+**Prueba de humo.**
+
+| Comprobación | Resultado |
+| --- | --- |
+| `GET /health` | `200` |
+| `POST /ask` sin clave | `401` |
+| `POST /ask` con clave | `200` |
+
+**Prueba de carga.** `python scripts/load_test.py https://hr-assistant-1q29.onrender.com
+--requests 25 --concurrency 5`:
+
+| Medida | Valor |
+| --- | --- |
+| Respuestas | 25 de 25 con `200`; ningún `5xx` ni petición sin respuesta |
+| `p50_ms` | 139.4 |
+| `p95_ms` | 2327.6 |
+| `rps` | 5.3 |
+| `costo_total_usd` | 0.002542 |
+
+Se usan 25 peticiones para quedar bajo el límite de 30 por minuto por cliente
+(`RATE_LIMIT_PER_MINUTE`), así ninguna recibe `429`. La p50 baja viene de la caché de respuestas
+(`ANSWER_CACHE_TTL_SECONDS=300`): las cinco preguntas de `load_test.py` se repiten y, después de
+la primera vez, salen de la caché. La p95 corresponde a las llamadas reales a Workers AI (fallos
+de caché); queda por encima de `SLO_P95_MS` = 2000 en esta medición, con una muestra pequeña.
+
+**Traza en LangSmith.** Un `POST /ask` de directorio dejó el run raíz `request` (0.86 s) con este
+árbol:
+
+```text
+request
+├── agent.guard
+├── agent.supervisor
+├── agent.directory
+│   ├── model.complete
+│   ├── search_by_department
+│   └── model.complete
+└── agent.reviewer
+```
+
+Las entradas y salidas se ven como «No inputs» y «No outputs» (`HIDE_INPUTS=true` y
+`HIDE_OUTPUTS=true`) y el run lleva los metadatos `client` y `request_id`.
 
 ## Reporte de costos
 
@@ -149,12 +201,31 @@ pregunta ni de la respuesta.
 
 ### LangSmith
 
-Para encender las trazas, agrega en Render > Environment `LANGSMITH_TRACING=true` y
-`LANGSMITH_API_KEY`. `HIDE_INPUTS` y `HIDE_OUTPUTS` ya están en `true` en el Blueprint y
-compliance no deja arrancar sin ellos. Cada `POST /ask` deja un run raíz `request` con
-`agent.guard`, `agent.supervisor`, `agent.directory` o `agent.policy` y `agent.reviewer`
-dentro. Busca por el metadato `request_id`; también llevan `client` y, desde el supervisor,
-`specialist`.
+Las trazas están apagadas por omisión: `LANGSMITH_TRACING` vale `false` en `app/config.py` y
+`render.yaml` no define ninguna variable de LangSmith. El producto traza solo si
+`LANGSMITH_TRACING=true` **y** `LANGSMITH_API_KEY` tiene valor; con una sola de las dos no manda
+nada y no avisa. Para encenderlas, agrega a mano en Render > Environment:
+
+1. `LANGSMITH_API_KEY`: la clave de LangSmith (secreto).
+2. `LANGSMITH_TRACING=true`.
+3. `LANGSMITH_PROJECT` (opcional): el proyecto donde quieres ver las trazas. Sin ella van al
+   proyecto `default`.
+4. `LANGSMITH_ENDPOINT`, solo si la cuenta es de la región de Europa:
+   `https://eu.api.smith.langchain.com`. Si la cuenta es de Europa y falta, las trazas no llegan
+   a tu cuenta.
+
+`LANGSMITH_PROJECT` y `LANGSMITH_ENDPOINT` no las lee el producto: las toma la librería
+`langsmith` del entorno al crear su cliente. `HIDE_INPUTS` y `HIDE_OUTPUTS` deben seguir en
+`true` (ya lo están en el Blueprint): con `LANGSMITH_TRACING=true` en producción, compliance no
+deja arrancar si alguna vale `false`. Guardar las variables reinicia el servicio; después manda
+una pregunta y busca la traza.
+
+Cada `POST /ask` deja un run raíz `request` con `agent.guard`, `agent.supervisor`,
+`agent.directory` o `agent.policy` y `agent.reviewer` dentro. Dentro del especialista aparecen
+las llamadas al modelo (`model.complete`) y las herramientas (`get_employee`,
+`search_by_department` o `search_policy`). Busca por el metadato `request_id`; también llevan
+`client` y, desde el supervisor, `specialist`. Ejemplo real en la
+[evidencia de producción](#evidencia-de-producción-2026-11-19).
 
 ## Qué hacer ante...
 
@@ -167,3 +238,4 @@ dentro. Busca por el metadato `request_id`; también llevan `client` y, desde el
 | `401` | Falta la clave o no coincide. | `auth_rejected` con `reason` `missing` o `invalid`. Comprueba la clave del consumidor contra `API_KEYS`. |
 | `400 request blocked by input policy` | El guardián vio una frase de prompt injection. | `audit` `input_blocked` y `security.blocked_inputs`. Si es un falso positivo recurrente, repórtalo para ajustar `INJECTION_PHRASES` (`app/guard.py`) con su prueba. |
 | `/ready` en `503` o despliegue fallido | Falta un dato (directorio, políticas o precios) o compliance rechazó la configuración. | El check en `"error"` dice cuál; el `ConfigError` del arranque nombra la variable y la regla, nunca el valor. |
+| No aparecen trazas en LangSmith | El producto no está trazando, o las trazas llegan a otro proyecto u otra región. | En orden: (1) que exista `LANGSMITH_TRACING=true` en Render > Environment: vale `false` por omisión y `render.yaml` no la define, así que con solo `LANGSMITH_API_KEY` no se traza nada; (2) que `LANGSMITH_API_KEY` tenga valor; (3) el proyecto: sin `LANGSMITH_PROJECT` las trazas van a `default`, búscalas ahí o en el proyecto que pusiste; (4) la región: si la cuenta es de Europa, falta `LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com`. Tras cambiar una variable, espera el reinicio y manda una pregunta nueva. `HIDE_INPUTS` y `HIDE_OUTPUTS` siguen en `true`. |

@@ -39,5 +39,8 @@ services:
       # quedar vacía o el producto no arranca (compliance).
       - key: METRICS_CLIENTS
         sync: false
-      # CF_AIG_TOKEN y LANGSMITH_API_KEY son opcionales y no van en el Blueprint:
-      # si se usan, se agregan a mano en Render > Environment.
+      # CF_AIG_TOKEN y las variables de LangSmith son opcionales y no van en el
+      # Blueprint: si se usan, se agregan a mano en Render > Environment.
+      # Para tener trazas hacen falta LANGSMITH_API_KEY y LANGSMITH_TRACING=true:
+      # app/config.py deja LANGSMITH_TRACING en false por defecto y sin ella la
+      # clave sola no enciende las trazas. LANGSMITH_PROJECT es opcional.
