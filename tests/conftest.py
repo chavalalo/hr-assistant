@@ -59,6 +59,41 @@ def keyed_client(app, **kwargs):
     return TestClient(app, headers={API_KEY_HEADER: TEST_API_KEY}, **kwargs)
 
 
+class SpyModel:  # pylint: disable=too-few-public-methods
+    """Modelo que guarda los mensajes de cada llamada y delega en otro.
+
+    :param model: Modelo que responde de verdad, por ejemplo ``FakeModel``
+    :type model: app.llm.LanguageModel
+    """
+
+    def __init__(self, model):
+        self._model = model
+        self.calls = []
+
+    def complete(self, messages):
+        """Anota los mensajes y delega en el modelo envuelto.
+
+        :param messages: Mensajes con ``role`` y ``content``
+        :type messages: Sequence[dict]
+        :return: Respuesta del modelo envuelto
+        :rtype: app.completion.Completion
+        """
+        self.calls.append([dict(message) for message in messages])
+        return self._model.complete(messages)
+
+
+@pytest.fixture
+def context():
+    """Datos que un paso Gherkin deja para los siguientes (espía, textos)."""
+    return {}
+
+
+@pytest.fixture
+def spy_model(directory):
+    """Espía sobre el modelo simulado que conoce los departamentos."""
+    return SpyModel(FakeModel(directory.departments()))
+
+
 @pytest.fixture
 def directory():
     """Directorio real de empleados, leído de ``product/data/employees.json``."""

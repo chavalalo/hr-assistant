@@ -1,4 +1,5 @@
-# Blueprint de Render para el HR Assistant (spec/04-production.md, punto 7).
+# Blueprint de Render para el HR Assistant (spec/04-production.md, punto 7, y
+# spec/05-reto.md, punto 9).
 # El servicio se llama igual que el repositorio para no actualizar por error otro
 # servicio que ya exista en la cuenta.
 services:
@@ -7,7 +8,10 @@ services:
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /health
+    # /ready revisa directorio, políticas y precios: Render no manda tráfico a una
+    # instancia a la que le falte alguno. /health sigue disponible para la prueba
+    # de humo.
+    healthCheckPath: /ready
     # Solo publica cuando el pipeline de CI pasa en el commit
     autoDeployTrigger: checksPass
     envVars:
@@ -20,11 +24,20 @@ services:
         value: "true"
       - key: HIDE_OUTPUTS
         value: "true"
-      # Secretos: Render pide su valor al crear el Blueprint; nunca van aquí.
-      # LANGSMITH_API_KEY es opcional y se agrega en Render > Environment.
+      # Caché de respuestas: 5 minutos (spec/05-reto.md, punto 7)
+      - key: ANSWER_CACHE_TTL_SECONDS
+        value: "300"
+      # Secretos y datos de la cuenta: Render pide su valor al crear el Blueprint;
+      # nunca van aquí.
       - key: API_KEYS
         sync: false
       - key: CF_ACCOUNT_ID
         sync: false
       - key: CF_API_TOKEN
         sync: false
+      # Clientes de API_KEYS que pueden leer /metrics; en producción no puede
+      # quedar vacía o el producto no arranca (compliance).
+      - key: METRICS_CLIENTS
+        sync: false
+      # CF_AIG_TOKEN y LANGSMITH_API_KEY son opcionales y no van en el Blueprint:
+      # si se usan, se agregan a mano en Render > Environment.

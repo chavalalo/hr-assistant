@@ -6,6 +6,11 @@
 Cada petición lleva un id (``X-Request-ID``), deja una línea JSON en el log y
 se cuenta en las métricas del proceso. ``POST /ask`` y ``GET /metrics`` piden
 la clave del cliente en ``X-API-Key`` y respetan su límite por minuto.
+``POST /ask`` delega en ``app.pipeline.AskPipeline`` (guardián, caché,
+supervisor, especialista y revisor) y responde 400 si el guardián bloquea la
+entrada. ``GET /metrics`` responde 403 a los clientes fuera de
+``METRICS_CLIENTS``. ``GET /dashboard`` sirve el tablero, sin datos ni clave:
+la página pide la clave y lee ``/metrics`` desde el navegador.
 """
 
 import os
@@ -19,22 +24,28 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from app.agent import Agent
-from app.auth import identify_client
+from app.auth import can_read_metrics, identify_client
+from app.cache import AnswerCache
 from app.clock import SystemClock
 from app.compliance import enforce
-from app.config import Settings
+from app.config import ConfigError, Settings
 from app.costs import PriceTable
 from app.directory import EmployeeDirectory
 from app.gateway import ModelUnavailable
-from app.levers import choose_model, trim_history
+from app.guard import InputBlocked
 from app.llm import build_models
 from app.logs import JsonLogger
-from app.metrics import Metrics
+from app.metrics import ACCESS_DENIED, Metrics
+from app.pipeline import AskPipeline, PipelineDependencies
+from app.policies import PolicyBook
 from app.ratelimit import RateLimiter
+from app.specialists import build_specialists
+from app.supervisor import Supervisor
 from app.tracing import build_tracer
 
-INDEX_PATH = Path(__file__).resolve().parent / "static" / "index.html"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+INDEX_PATH = STATIC_DIR / "index.html"
+DASHBOARD_PATH = STATIC_DIR / "dashboard.html"
 REQUEST_ID_HEADER = "X-Request-ID"
 API_KEY_HEADER = "X-API-Key"
 RETRY_AFTER_HEADER = "Retry-After"
@@ -43,11 +54,17 @@ UNAUTHORIZED_DETAIL = "invalid or missing API key"
 RATE_LIMITED_STATUS = 429
 RATE_LIMITED_DETAIL = "rate limit exceeded"
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
-AUDIT_ARG_MAX_CHARS = 200
 INTERNAL_ERROR_STATUS = 500
+NOT_READY_STATUS = 503
+READY_OK = "ok"
+READY_ERROR = "error"
 INTERNAL_ERROR_DETAIL = "internal error"
 MODEL_UNAVAILABLE_STATUS = 502
 MODEL_UNAVAILABLE_DETAIL = "model unavailable"
+BLOCKED_STATUS = 400
+BLOCKED_DETAIL = "request blocked by input policy"
+FORBIDDEN_STATUS = 403
+FORBIDDEN_DETAIL = "forbidden"
 
 
 class HistoryMessage(BaseModel):
@@ -78,14 +95,26 @@ class AskResponse(BaseModel):
     :type output_tokens: int
     :param request_id: Id de la petición, para pasarlo a soporte
     :type request_id: str
-    :param model: Modelo que eligió el enrutador
+    :param model: Modelo que contestó
     :type model: str
     :param route: Motivo del enrutador
     :type route: str
     :param cached_calls: Llamadas respondidas desde la caché del gateway
     :type cached_calls: int
-    :param cost_usd: Costo de la respuesta en USD
+    :param cost_usd: Costo de la respuesta en USD (supervisor y especialista)
     :type cost_usd: float
+    :param specialist: Especialista que respondió: ``directory`` o ``policy``
+    :type specialist: str
+    :param agents: Agentes que corrieron, en orden
+    :type agents: list[str]
+    :param supervisor_route: Motivo del supervisor
+    :type supervisor_route: str
+    :param pii_redacted: Tipos de dato personal ocultados, ordenados
+    :type pii_redacted: list[str]
+    :param cached: ``True`` si salió de la caché de respuestas
+    :type cached: bool
+    :param fallback: ``True`` si respondió el modelo de respaldo
+    :type fallback: bool
     """
 
     answer: str
@@ -98,6 +127,12 @@ class AskResponse(BaseModel):
     route: str
     cached_calls: int
     cost_usd: float
+    specialist: str
+    agents: List[str]
+    supervisor_route: str
+    pii_redacted: List[str]
+    cached: bool
+    fallback: bool
 
 
 @dataclass(frozen=True)
@@ -110,8 +145,12 @@ class _Runtime:  # pylint: disable=too-many-instance-attributes
     :type models: dict[str, app.llm.LanguageModel]
     :param prices: Tabla de precios por modelo
     :type prices: app.costs.PriceTable
-    :param agent: Agente que responde las preguntas
-    :type agent: app.agent.Agent
+    :param directory: Directorio de empleados (``/ready``)
+    :type directory: app.directory.EmployeeDirectory
+    :param policies: Libro de políticas (``/ready``)
+    :type policies: app.policies.PolicyBook
+    :param pipeline: Agentes que responden las preguntas
+    :type pipeline: app.pipeline.AskPipeline
     :param tracer: Tracer de la corrida
     :type tracer: app.tracing.NoopTracer or app.tracing.LangSmithTracer
     :param logger: Log JSON
@@ -122,6 +161,8 @@ class _Runtime:  # pylint: disable=too-many-instance-attributes
     :type ask_request: type
     :param index_html: Página web
     :type index_html: str
+    :param dashboard_html: Tablero de métricas (sin datos ni clave)
+    :type dashboard_html: str
     :param limiter: Límite de peticiones por cliente
     :type limiter: app.ratelimit.RateLimiter
     """
@@ -129,12 +170,15 @@ class _Runtime:  # pylint: disable=too-many-instance-attributes
     settings: Settings
     models: dict
     prices: PriceTable
-    agent: Agent
+    directory: EmployeeDirectory
+    policies: PolicyBook
+    pipeline: AskPipeline
     tracer: object
     logger: JsonLogger
     metrics: Metrics
     ask_request: type
     index_html: str
+    dashboard_html: str
     limiter: RateLimiter
 
 
@@ -194,109 +238,41 @@ def resolve_request_id(header_value):
     return str(uuid.uuid4())
 
 
-def _audit_args(args):
-    """Recorta los argumentos de una herramienta para el log de auditoría.
+def _check(probe):
+    """Corre una comprobación de ``/ready`` sin dejar salir el error.
 
-    :param args: Argumentos con que se llamó la herramienta
-    :type args: dict
-    :return: Argumentos con los textos recortados a ``AUDIT_ARG_MAX_CHARS``
-    :rtype: dict
+    :param probe: Función sin argumentos que devuelve un conteo
+    :type probe: callable
+    :return: ``ok`` si el conteo es mayor que cero; si no, ``error``
+    :rtype: str
     """
-    return {
-        key: value[:AUDIT_ARG_MAX_CHARS] if isinstance(value, str) else value
-        for key, value in args.items()
-    }
+    try:
+        healthy = probe() > 0
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Solo el estado: el mensaje puede traer rutas del servidor.
+        healthy = False
+    return READY_OK if healthy else READY_ERROR
 
 
-def _log_agent_run(logger, request_id, payload, result, usage):
-    """Escribe un ``audit`` por herramienta y el ``agent_run`` de la corrida.
-
-    Solo se registran conteos, modelo y costo: nunca el texto de la pregunta
-    ni de la respuesta.
-
-    :param logger: Log JSON
-    :type logger: app.logs.JsonLogger
-    :param request_id: Id de la petición
-    :type request_id: str
-    :param payload: Cuerpo de la petición
-    :type payload: pydantic.BaseModel
-    :param result: Resultado del agente
-    :type result: app.agent.AgentResult
-    :param usage: ``client``, ``model``, ``route``, ``history_sent``,
-        ``cached_calls`` y ``cost_usd`` de la corrida
-    :type usage: dict
-    """
-    for call in result.tool_calls:
-        logger.emit(
-            "audit",
-            request_id,
-            client=usage["client"],
-            action="tool_call",
-            tool=call["tool"],
-            args=_audit_args(call["args"]),
-        )
-    logger.emit(
-        "agent_run",
-        request_id,
-        question_chars=len(payload.question),
-        history_messages=len(payload.history),
-        steps=result.steps,
-        tools=list(result.tools_used),
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-        stopped=result.stopped,
-        **usage,
-    )
-
-
-def _answer(runtime, request_id, client, payload):
-    """Enruta, recorta el historial, corre el agente y calcula el costo.
+def _readiness(runtime):
+    """Revisa que los datos de los que depende ``/ask`` sigan disponibles.
 
     :param runtime: Dependencias ya construidas
     :type runtime: _Runtime
-    :param request_id: Id de la petición
-    :type request_id: str
-    :param client: Nombre del cliente que pregunta
-    :type client: str
-    :param payload: Cuerpo de la petición
-    :type payload: pydantic.BaseModel
-    :return: Respuesta de ``POST /ask``
-    :rtype: AskResponse
-    :raises app.gateway.ModelUnavailable: Si el gateway falla
+    :return: Estado por dato: ``directory``, ``policies`` y ``prices``
+    :rtype: dict[str, str]
     """
     settings = runtime.settings
-    route = choose_model(payload.question, settings)
-    history = trim_history(
-        [message.model_dump() for message in payload.history],
-        settings.history_window,
-    )
-    messages = history + [{"role": "user", "content": payload.question}]
-    with runtime.tracer.context(request_id, client=client):
-        result = runtime.agent.run(messages, model=runtime.models[route.model])
-    cost_usd = runtime.prices.cost(route.model, result.completions)
-    usage = {
-        "client": client,
-        "model": route.model,
-        "route": route.reason,
-        "history_sent": len(history),
-        "cached_calls": result.cached_calls,
-        "cost_usd": cost_usd,
+
+    def priced_models():
+        models = (settings.model_small, settings.model_large)
+        return sum(1 for model in models if runtime.prices.price(model))
+
+    return {
+        "directory": _check(runtime.directory.count),
+        "policies": _check(runtime.policies.count),
+        "prices": _check(priced_models),
     }
-    _log_agent_run(runtime.logger, request_id, payload, result, usage)
-    runtime.metrics.add_tokens(result.input_tokens, result.output_tokens)
-    runtime.metrics.add_cost(cost_usd)
-    return AskResponse(
-        answer=result.answer,
-        steps=result.steps,
-        tools_used=list(result.tools_used),
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-        request_id=request_id,
-        model=route.model,
-        route=route.reason,
-        cached_calls=result.cached_calls,
-        cost_usd=cost_usd,
-    )
 
 
 def _install_observability(application, clock, logger, metrics):
@@ -394,7 +370,8 @@ def _client_dependency(runtime):
 def _add_routes(application, runtime):
     """Registra las rutas de la API.
 
-    ``/`` y ``/health`` son públicas; ``/ask`` y ``/metrics`` piden clave.
+    ``/``, ``/dashboard``, ``/health`` y ``/ready`` son públicas; ``/ask`` y
+    ``/metrics`` piden clave.
 
     :param application: Aplicación FastAPI
     :type application: fastapi.FastAPI
@@ -409,16 +386,60 @@ def _add_routes(application, runtime):
         """Sirve la página web."""
         return HTMLResponse(runtime.index_html)
 
+    @application.get("/dashboard", response_class=HTMLResponse)
+    def dashboard():
+        """Sirve el tablero: HTML estático, sin datos ni clave.
+
+        La página pide la clave y lee ``/metrics`` desde el navegador.
+        """
+        return HTMLResponse(runtime.dashboard_html)
+
     @application.get("/health")
     def health():
         """Informa que el proceso está vivo y su id."""
         return {"status": "ok", "pid": os.getpid()}
 
-    @application.get("/metrics", dependencies=[Depends(require_client)])
-    def metrics():
-        """Devuelve las métricas de este proceso con el costo acumulado."""
+    @application.get("/ready")
+    def ready():
+        """Informa si el directorio, las políticas y los precios responden."""
+        checks = _readiness(runtime)
+        if all(value == READY_OK for value in checks.values()):
+            return {"status": "ready", "checks": checks}
+        return JSONResponse(
+            status_code=NOT_READY_STATUS,
+            content={"status": "not_ready", "checks": checks},
+        )
+
+    @application.get("/metrics")
+    def metrics(request: Request, client: str = Depends(require_client)):
+        """Devuelve las métricas de este proceso: operativas y de negocio.
+
+        Agrega al formato de la sesión 2 el costo acumulado, ``by_specialist``,
+        ``by_client``, ``security``, ``cache``, ``fallbacks`` y ``supervisor``.
+        Orden: 401 -> 429 -> 403 si ``METRICS_CLIENTS`` no nombra al cliente.
+        """
+        request_id = request.state.request_id
+        if not can_read_metrics(client, runtime.settings.metrics_clients):
+            runtime.logger.emit(
+                "audit",
+                request_id,
+                client=client,
+                action="access_denied",
+                path=request.url.path,
+            )
+            runtime.metrics.add_security(ACCESS_DENIED)
+            return JSONResponse(
+                status_code=FORBIDDEN_STATUS, content={"detail": FORBIDDEN_DETAIL}
+            )
+        runtime.logger.emit(
+            "audit", request_id, client=client, action="metrics_read"
+        )
         snapshot = runtime.metrics.snapshot(os.getpid())
         snapshot["cost_usd"] = runtime.metrics.cost_usd()
+        snapshot.update(runtime.metrics.business())
+        snapshot["security"] = runtime.metrics.security()
+        snapshot["cache"] = runtime.metrics.cache()
+        snapshot["fallbacks"] = runtime.metrics.fallbacks()
         return snapshot
 
     @application.post("/ask", response_model=AskResponse)
@@ -430,7 +451,14 @@ def _add_routes(application, runtime):
         """Responde una pregunta; el historial lo manda el cliente."""
         request_id = request.state.request_id
         try:
-            return _answer(runtime, request_id, client, payload)
+            outcome = runtime.pipeline.answer(request_id, client, payload)
+            return AskResponse(request_id=request_id, **outcome.response_fields())
+        except InputBlocked:
+            # El pipeline ya escribió el audit; el cuerpo nunca repite el texto.
+            return JSONResponse(
+                status_code=BLOCKED_STATUS,
+                content={"detail": BLOCKED_DETAIL, "request_id": request_id},
+            )
         except ModelUnavailable as error:
             # Solo el tipo: nunca la URL (con la cuenta) ni el token.
             runtime.logger.emit("error", request_id, error_type=type(error).__name__)
@@ -438,6 +466,22 @@ def _add_routes(application, runtime):
                 status_code=MODEL_UNAVAILABLE_STATUS,
                 content={"detail": MODEL_UNAVAILABLE_DETAIL, "request_id": request_id},
             )
+
+
+def _load_policies(path):
+    """Carga las políticas al arrancar.
+
+    :param path: Ruta al archivo ``policies.json``
+    :type path: pathlib.Path
+    :return: Libro de políticas
+    :rtype: app.policies.PolicyBook
+    :raises app.config.ConfigError: Si el archivo no se puede leer o no tiene
+        el formato esperado
+    """
+    try:
+        return PolicyBook.load(path)
+    except (OSError, ValueError):
+        raise ConfigError("POLICIES_PATH is not a valid policies file") from None
 
 
 def _resolve_models(settings, model, models, build):
@@ -459,6 +503,24 @@ def _resolve_models(settings, model, models, build):
     if model is not None:
         return {settings.model_small: model, settings.model_large: model}
     return build()
+
+
+def _build_answer_cache(settings, clock):
+    """Crea la caché de respuestas si está encendida.
+
+    :param settings: Configuración con ``ANSWER_CACHE_TTL_SECONDS`` y
+        ``ANSWER_CACHE_MAX_ENTRIES``
+    :type settings: app.config.Settings
+    :param clock: Reloj que mide la vida de cada respuesta
+    :type clock: app.clock.Clock
+    :return: Caché o ``None`` si el TTL es 0
+    :rtype: app.cache.AnswerCache or None
+    """
+    if settings.answer_cache_ttl_seconds <= 0:
+        return None
+    return AnswerCache(
+        settings.answer_cache_ttl_seconds, settings.answer_cache_max_entries, clock
+    )
 
 
 # Las dependencias se inyectan por nombre para las pruebas.
@@ -505,29 +567,53 @@ def create_app(
     settings = settings or Settings.from_env(os.environ)
     enforce(settings)
     directory = directory or EmployeeDirectory(settings.employees_path)
+    policies = _load_policies(settings.policies_path)
+    clock = clock if clock is not None else SystemClock()
     models = _resolve_models(
         settings,
         model,
         models,
-        lambda: build_models(settings, directory.departments(), http_client),
+        lambda: build_models(
+            settings,
+            directory.departments(),
+            http_client,
+            policies.keywords(),
+            # Relojes de prueba viejos sin ``sleep``: se usa ``time.sleep``.
+            sleep=getattr(clock, "sleep", None),
+        ),
     )
-    clock = clock if clock is not None else SystemClock()
     tracer = tracer if tracer is not None else build_tracer(settings)
-    runtime = _Runtime(
+    dependencies = PipelineDependencies(
         settings=settings,
         models=models,
         prices=prices if prices is not None else PriceTable.load(settings.prices_path),
-        agent=Agent(
-            model=models[settings.model_large],
-            directory=directory,
-            max_steps=settings.agent_max_steps,
-            tracer=tracer,
+        supervisor=Supervisor(
+            model=models[settings.model_small],
+            departments=directory.departments(),
+            policies=policies,
         ),
+        specialists=build_specialists(
+            directory, policies, settings.agent_max_steps, tracer
+        ),
+        directory=directory,
         tracer=tracer,
         logger=JsonLogger(settings.service_name, clock, log_stream),
         metrics=Metrics(settings.slo_p95_ms),
+        answer_cache=_build_answer_cache(settings, clock),
+    )
+    runtime = _Runtime(
+        settings=settings,
+        models=models,
+        prices=dependencies.prices,
+        directory=directory,
+        policies=policies,
+        pipeline=AskPipeline(dependencies),
+        tracer=tracer,
+        logger=dependencies.logger,
+        metrics=dependencies.metrics,
         ask_request=_build_ask_request(settings.max_question_chars),
         index_html=INDEX_PATH.read_text(encoding="utf-8"),
+        dashboard_html=DASHBOARD_PATH.read_text(encoding="utf-8"),
         limiter=RateLimiter(settings.rate_limit_per_minute, clock),
     )
 

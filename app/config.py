@@ -5,6 +5,7 @@ inválido impide arrancar con un mensaje claro.
 """
 
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -42,6 +43,16 @@ BOOLEAN_VALUES = {"true": True, "false": False}
 SUPPORTED_ENVIRONMENTS = ("development", "production")
 DEFAULT_ENVIRONMENT = "development"
 DEFAULT_RATE_LIMIT_PER_MINUTE = "30"
+FAKE_PROVIDER = "fake"
+LIST_SEPARATOR = ","
+CLIENT_NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+DEFAULT_MAX_ANSWER_CHARS = "1500"
+DEFAULT_MODEL_RETRIES = "2"
+DEFAULT_MODEL_RETRY_BACKOFF_SECONDS = "0.5"
+DEFAULT_MODEL_FALLBACK = "true"
+DEFAULT_ANSWER_CACHE_TTL_SECONDS = "0"
+DEFAULT_ANSWER_CACHE_MAX_ENTRIES = "256"
+DEFAULT_POLICIES_PATH = "data/policies.json"
 
 
 def _positive_int(environ, name, default):
@@ -343,6 +354,103 @@ def _model_settings(environ):
     }
 
 
+def _name_list(environ, name):
+    """Lee una lista de nombres separados por coma; vacía si no hay valor.
+
+    :param environ: Variables de entorno
+    :type environ: Mapping[str, str]
+    :param name: Nombre de la variable
+    :type name: str
+    :return: Nombres sin espacios a los lados, sin entradas vacías
+    :rtype: tuple[str, ...]
+    """
+    raw = str(environ.get(name, "") or "")
+    return tuple(
+        entry.strip() for entry in raw.split(LIST_SEPARATOR) if entry.strip()
+    )
+
+
+def _metrics_clients(environ):
+    """Lee los clientes que pueden leer ``GET /metrics``.
+
+    El mensaje de error solo dice la posición de la entrada inválida.
+
+    :param environ: Variables de entorno
+    :type environ: Mapping[str, str]
+    :return: Nombres de clientes; vacía significa que todos pueden leerlas
+    :rtype: tuple[str, ...]
+    :raises ConfigError: Si un nombre tiene caracteres no permitidos
+    """
+    names = _name_list(environ, "METRICS_CLIENTS")
+    for position, client in enumerate(names, start=1):
+        if not CLIENT_NAME_PATTERN.fullmatch(client):
+            raise ConfigError(
+                f"METRICS_CLIENTS entry {position} is not a valid client name"
+            )
+    return names
+
+
+def _fake_unavailable_models(environ, provider):
+    """Lee los modelos simulados que deben fallar como el gateway.
+
+    :param environ: Variables de entorno
+    :type environ: Mapping[str, str]
+    :param provider: Proveedor del modelo ya validado
+    :type provider: str
+    :return: Nombres de los modelos que fallan
+    :rtype: tuple[str, ...]
+    :raises ConfigError: Si tiene valor y el proveedor no es ``fake``
+    """
+    names = _name_list(environ, "FAKE_UNAVAILABLE_MODELS")
+    if names and provider != FAKE_PROVIDER:
+        raise ConfigError(
+            "FAKE_UNAVAILABLE_MODELS only applies when MODEL_PROVIDER=fake"
+        )
+    return names
+
+
+def _challenge_settings(environ, provider):
+    """Lee las variables del reto: revisor, resiliencia, métricas y caché.
+
+    ``CF_AIG_TOKEN`` se guarda sin validar: es un secreto y ningún mensaje de
+    error lo muestra.
+
+    :param environ: Variables de entorno
+    :type environ: Mapping[str, str]
+    :param provider: Proveedor del modelo ya validado
+    :type provider: str
+    :return: Campos nuevos de la configuración
+    :rtype: dict
+    :raises ConfigError: Si algún valor es inválido
+    """
+    return {
+        "max_answer_chars": _positive_int(
+            environ, "MAX_ANSWER_CHARS", DEFAULT_MAX_ANSWER_CHARS
+        ),
+        "model_retries": _non_negative_int(
+            environ, "MODEL_RETRIES", DEFAULT_MODEL_RETRIES
+        ),
+        "model_retry_backoff_seconds": _non_negative_float(
+            environ,
+            "MODEL_RETRY_BACKOFF_SECONDS",
+            DEFAULT_MODEL_RETRY_BACKOFF_SECONDS,
+        ),
+        "model_fallback": _boolean(environ, "MODEL_FALLBACK", DEFAULT_MODEL_FALLBACK),
+        "fake_unavailable_models": _fake_unavailable_models(environ, provider),
+        "cf_aig_token": str(environ.get("CF_AIG_TOKEN", "") or "").strip(),
+        "metrics_clients": _metrics_clients(environ),
+        "answer_cache_ttl_seconds": _non_negative_int(
+            environ, "ANSWER_CACHE_TTL_SECONDS", DEFAULT_ANSWER_CACHE_TTL_SECONDS
+        ),
+        "answer_cache_max_entries": _positive_int(
+            environ, "ANSWER_CACHE_MAX_ENTRIES", DEFAULT_ANSWER_CACHE_MAX_ENTRIES
+        ),
+        "policies_path": _existing_file(
+            environ, "POLICIES_PATH", DEFAULT_POLICIES_PATH
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class Settings:  # pylint: disable=too-many-instance-attributes
     """Configuración inmutable de la aplicación.
@@ -398,6 +506,27 @@ class Settings:  # pylint: disable=too-many-instance-attributes
     :param langsmith_tracing_requested: ``LANGSMITH_TRACING`` vale ``true``,
         haya o no clave de LangSmith
     :type langsmith_tracing_requested: bool
+    :param max_answer_chars: Largo máximo de la respuesta (revisor)
+    :type max_answer_chars: int
+    :param model_retries: Reintentos del gateway ante timeout, 429 o 5xx
+    :type model_retries: int
+    :param model_retry_backoff_seconds: Primera espera entre reintentos
+    :type model_retry_backoff_seconds: float
+    :param model_fallback: Repetir el especialista una vez con el otro modelo
+    :type model_fallback: bool
+    :param fake_unavailable_models: Modelos simulados que fallan como el gateway
+    :type fake_unavailable_models: tuple[str, ...]
+    :param cf_aig_token: Token de AI Gateway autenticado (secreto: no sale en
+        ``repr``)
+    :type cf_aig_token: str
+    :param metrics_clients: Clientes que leen ``/metrics``; vacía: todos
+    :type metrics_clients: tuple[str, ...]
+    :param answer_cache_ttl_seconds: Vida de la caché de respuestas (0: apagada)
+    :type answer_cache_ttl_seconds: int
+    :param answer_cache_max_entries: Tope de entradas de la caché de respuestas
+    :type answer_cache_max_entries: int
+    :param policies_path: Ruta absoluta al archivo de políticas
+    :type policies_path: pathlib.Path
     """
 
     model_provider: str
@@ -425,6 +554,16 @@ class Settings:  # pylint: disable=too-many-instance-attributes
     api_clients: tuple = field(default=(), repr=False)
     rate_limit_per_minute: int = int(DEFAULT_RATE_LIMIT_PER_MINUTE)
     langsmith_tracing_requested: bool = False
+    max_answer_chars: int = int(DEFAULT_MAX_ANSWER_CHARS)
+    model_retries: int = int(DEFAULT_MODEL_RETRIES)
+    model_retry_backoff_seconds: float = float(DEFAULT_MODEL_RETRY_BACKOFF_SECONDS)
+    model_fallback: bool = True
+    fake_unavailable_models: tuple = ()
+    cf_aig_token: str = field(default="", repr=False)
+    metrics_clients: tuple = ()
+    answer_cache_ttl_seconds: int = int(DEFAULT_ANSWER_CACHE_TTL_SECONDS)
+    answer_cache_max_entries: int = int(DEFAULT_ANSWER_CACHE_MAX_ENTRIES)
+    policies_path: Path = PRODUCT_DIR / DEFAULT_POLICIES_PATH
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> "Settings":
@@ -459,4 +598,5 @@ class Settings:  # pylint: disable=too-many-instance-attributes
             **_cloudflare_settings(environ, provider),
             **_model_settings(environ),
             **_security_settings(environ),
+            **_challenge_settings(environ, provider),
         )

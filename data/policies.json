@@ -1,0 +1,27 @@
+[
+  {
+    "topic": "vacaciones",
+    "keywords": ["vacaciones", "dias de descanso", "prima vacacional"],
+    "text": "Vacaciones: 12 días hábiles a partir del primer año, que aumentan 2 días por año hasta llegar a 20. Se piden con 15 días de anticipación en el portal de RH y la prima vacacional es de 25 %."
+  },
+  {
+    "topic": "home office",
+    "keywords": ["home office", "trabajo remoto", "teletrabajo", "remoto"],
+    "text": "Home office: hasta 2 días por semana con aprobación del líder directo. Se registra en el portal de RH y el equipo de cómputo lo entrega la empresa."
+  },
+  {
+    "topic": "horario",
+    "keywords": ["horario", "jornada", "hora de entrada", "hora de salida"],
+    "text": "Horario: jornada de 9:00 a 18:00 con una hora de comida. Hay horario flexible de entrada entre 8:00 y 10:00."
+  },
+  {
+    "topic": "permisos",
+    "keywords": ["permiso", "permisos", "licencia", "incapacidad", "paternidad", "maternidad"],
+    "text": "Permisos: 3 días con goce de sueldo por matrimonio o fallecimiento de un familiar directo. La licencia de paternidad es de 10 días hábiles y la de maternidad de 12 semanas. Las incapacidades se entregan a RH en 48 horas."
+  },
+  {
+    "topic": "prestaciones",
+    "keywords": ["prestaciones", "aguinaldo", "seguro de gastos medicos", "vales de despensa"],
+    "text": "Prestaciones: aguinaldo de 30 días, seguro de gastos médicos mayores para la persona y sus dependientes, y vales de despensa mensuales."
+  }
+]

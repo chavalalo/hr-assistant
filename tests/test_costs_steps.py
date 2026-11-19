@@ -1,10 +1,7 @@
 """Pasos de ``features/costs.feature``: enrutador, ventana, gateway y costo."""
 
 import httpx
-import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
-
-from app.llm import FakeModel
 
 scenarios("features/costs.feature")
 
@@ -12,25 +9,6 @@ SMALL = "@cf/meta/llama-3.1-8b-instruct-fast"
 LARGE = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 GATEWAY_PROMPT_TOKENS = 42
 GATEWAY_COMPLETION_TOKENS = 7
-
-
-@pytest.fixture
-def context():
-    """Datos que un paso deja para los siguientes (espía, historial, pregunta)."""
-    return {}
-
-
-class SpyModel:  # pylint: disable=too-few-public-methods
-    """Modelo simulado que guarda los mensajes de cada llamada."""
-
-    def __init__(self, model):
-        self._model = model
-        self.calls = []
-
-    def complete(self, messages):
-        """Anota los mensajes y delega en el modelo simulado."""
-        self.calls.append([dict(message) for message in messages])
-        return self._model.complete(messages)
 
 
 def gateway_client(status, headers=None):
@@ -79,12 +57,12 @@ def priced_assistant_with(make_cost_client, name, value):
     ),
     target_fixture="client",
 )
-def priced_assistant_with_spy(make_cost_client, directory, window, context):
+def priced_assistant_with_spy(make_cost_client, spy_model, window, context):
     """Aplicación cuyos dos modelos son el mismo espía."""
-    spy = SpyModel(FakeModel(directory.departments()))
-    context["spy"] = spy
+    context["spy"] = spy_model
     return make_cost_client(
-        {"HISTORY_WINDOW": str(window)}, models={SMALL: spy, LARGE: spy}
+        {"HISTORY_WINDOW": str(window)},
+        models={SMALL: spy_model, LARGE: spy_model},
     )
 
 
@@ -147,17 +125,56 @@ def answer_costs_more_than_zero(response):
     assert response.json()["cost_usd"] > 0
 
 
+def is_supervisor_call(messages):
+    """Dice si una llamada al modelo es la clasificación del supervisor.
+
+    :param messages: Mensajes de una llamada
+    :type messages: list[dict]
+    :return: ``True`` si el primer mensaje es el prompt del supervisor
+    :rtype: bool
+    """
+    # Import local: si falta el módulo fallan solo los pasos que lo usan.
+    from app.prompts import SUPERVISOR_PROMPT  # pylint: disable=import-outside-toplevel
+
+    return bool(messages) and messages[0] == {
+        "role": "system",
+        "content": SUPERVISOR_PROMPT,
+    }
+
+
+@then("the supervisor classified only the question, without the history")
+def supervisor_classified_question(context):
+    """Spec 05: «Hola» no tiene regla; la primera llamada es del supervisor."""
+    # Import local: si falta el módulo fallan solo los pasos que lo usan.
+    from app.prompts import SUPERVISOR_PROMPT  # pylint: disable=import-outside-toplevel
+
+    assert context["spy"].calls[0] == [
+        {"role": "system", "content": SUPERVISOR_PROMPT},
+        {"role": "user", "content": context["question"]},
+    ]
+
+
 @then(
     parsers.parse(
         "the model received only the last {window:d} history messages and the question"
     )
 )
 def model_received_window(context, window):
-    """La primera llamada al modelo lleva solo la ventana y la pregunta."""
+    """La primera llamada del especialista lleva solo la ventana y la pregunta.
+
+    Se ignora un posible prompt de sistema del especialista: lo que se prueba
+    aquí es la ventana del historial de la sesión 3.
+    """
     expected = context["history"][-window:] + [
         {"role": "user", "content": context["question"]}
     ]
-    assert context["spy"].calls[0] == expected
+    specialist_calls = [
+        call for call in context["spy"].calls if not is_supervisor_call(call)
+    ]
+    first = [
+        message for message in specialist_calls[0] if message["role"] != "system"
+    ]
+    assert first == expected
 
 
 @then(
@@ -189,18 +206,25 @@ def log_has_gateway_error(read_log, log_stream, error_type):
     assert "acc-123" not in text
 
 
-@then(parsers.parse("the answer has {count:d} cached call and costs {cost:g}"))
+@then(parsers.parse("the answer has {count:d} cached calls and costs {cost:g}"))
 def answer_is_cached(response, count, cost):
-    """Una llamada HIT se cuenta como cacheada y no cuesta."""
+    """Cada llamada HIT se cuenta como cacheada y no cuesta.
+
+    Spec 05: «Hola» no tiene regla, así que hay dos llamadas al gateway: la
+    clasificación del supervisor y el especialista. La respuesta del gateway no
+    es una clasificación válida, por eso el supervisor usa ``directory``.
+    """
     body = response.json()
     assert body["cached_calls"] == count
     assert body["cost_usd"] == cost
     assert body["answer"] == "Hola desde la caché"
+    assert body["supervisor_route"] == "model_invalid"
+    assert body["specialist"] == "directory"
 
 
-@then("the answer still reports the tokens of the gateway")
+@then("the answer still reports the tokens of both gateway calls")
 def answer_reports_gateway_tokens(response):
-    """Los tokens se reportan aunque la llamada haya sido cacheada."""
+    """Los tokens suman supervisor y especialista aunque vengan de la caché."""
     body = response.json()
-    assert body["input_tokens"] == GATEWAY_PROMPT_TOKENS
-    assert body["output_tokens"] == GATEWAY_COMPLETION_TOKENS
+    assert body["input_tokens"] == 2 * GATEWAY_PROMPT_TOKENS
+    assert body["output_tokens"] == 2 * GATEWAY_COMPLETION_TOKENS

@@ -3,9 +3,80 @@
 Sin trazas se usa ``NoopTracer``, que no importa ``langsmith`` ni abre
 conexiones. La clave ``LANGSMITH_API_KEY`` la lee ``langsmith`` del entorno;
 este módulo nunca la toca.
+
+Una petición de ``POST /ask`` deja un run raíz ``request`` y, dentro, un run
+por agente: ``agent.guard``, ``agent.supervisor``, ``agent.directory`` o
+``agent.policy`` y ``agent.reviewer``. ``run_traced`` arma esos runs sin
+entradas: la función trazada no recibe argumentos y su salida es un resumen
+(tipos, conteos y decisiones), así el texto de la persona nunca llega a la
+traza por el run raíz ni por el guardián.
 """
 
 import contextlib
+
+TRACE_REQUEST = "request"
+TRACE_AGENT_PREFIX = "agent."
+CHAIN_RUN_TYPE = "chain"
+
+
+def trace_metadata(request_id, client=None, specialist=None):
+    """Arma los metadatos de una traza.
+
+    ``specialist`` solo aparece cuando ya se conoce (después del supervisor).
+
+    :param request_id: Id de la petición
+    :type request_id: str
+    :param client: Nombre del cliente (nunca su clave)
+    :type client: str or None
+    :param specialist: Especialista elegido, si ya se eligió
+    :type specialist: str or None
+    :return: Metadatos ``request_id``, ``client`` y, si hay, ``specialist``
+    :rtype: dict
+    """
+    metadata = {"request_id": request_id, "client": client}
+    if specialist is not None:
+        metadata["specialist"] = specialist
+    return metadata
+
+
+def agent_trace_name(agent):
+    """Nombre de la traza de un agente.
+
+    :param agent: Nombre del agente (``guard``, ``supervisor``...)
+    :type agent: str
+    :return: ``agent.<nombre>``
+    :rtype: str
+    """
+    return TRACE_AGENT_PREFIX + agent
+
+
+def run_traced(tracer, name, action, summarize=None):
+    """Corre ``action`` como un run propio, sin entradas y con salida resumida.
+
+    La función que se traza no recibe argumentos (la traza no tiene entradas)
+    y devuelve ``summarize(valor)``; quien llama recibe el valor completo. Los
+    errores siguen su camino sin cambios.
+
+    :param tracer: Tracer con el método ``wrap(fn, name, run_type)``
+    :type tracer: NoopTracer or LangSmithTracer
+    :param name: Nombre del run, por ejemplo ``agent.guard``
+    :type name: str
+    :param action: Función sin argumentos que hace el trabajo
+    :type action: callable
+    :param summarize: Convierte el valor en la salida de la traza (solo
+        tipos, conteos y decisiones); si falta, la salida es vacía
+    :type summarize: callable or None
+    :return: Lo que devuelve ``action``
+    :rtype: object
+    """
+    holder = {}
+
+    def traced_body():
+        holder["value"] = action()
+        return summarize(holder["value"]) if summarize is not None else {}
+
+    tracer.wrap(traced_body, name, CHAIN_RUN_TYPE)()
+    return holder["value"]
 
 
 class NoopTracer:
@@ -26,13 +97,16 @@ class NoopTracer:
         return fn
 
     @contextlib.contextmanager
-    def context(self, request_id, client=None):  # pylint: disable=unused-argument
+    # pylint: disable-next=unused-argument
+    def context(self, request_id, client=None, specialist=None):
         """Contexto vacío para una petición.
 
         :param request_id: Id de la petición
         :type request_id: str
         :param client: Nombre del cliente (nunca su clave)
         :type client: str or None
+        :param specialist: Especialista elegido, si ya se eligió
+        :type specialist: str or None
         :return: Generador del contexto
         :rtype: typing.Iterator[str]
         """
@@ -75,18 +149,23 @@ class LangSmithTracer:
         return decorator(fn)
 
     @contextlib.contextmanager
-    def context(self, request_id, client=None):
-        """Pone el ``request_id`` y el cliente en los metadatos de las trazas.
+    def context(self, request_id, client=None, specialist=None):
+        """Pone ``request_id``, cliente y especialista en los metadatos.
+
+        Se puede anidar: el contexto interno (con ``specialist``) conserva el
+        run padre, así los runs de los agentes quedan dentro de ``request``.
 
         :param request_id: Id de la petición
         :type request_id: str
         :param client: Nombre del cliente (nunca su clave)
         :type client: str or None
+        :param specialist: Especialista elegido, si ya se eligió
+        :type specialist: str or None
         :return: Generador del contexto
         :rtype: typing.Iterator[str]
         """
         with self._langsmith.tracing_context(
-            metadata={"request_id": request_id, "client": client},
+            metadata=trace_metadata(request_id, client, specialist),
             enabled=True,
             client=self._client,
         ):
