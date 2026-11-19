@@ -14,6 +14,7 @@ from app.directory import normalize
 
 TOPICS_PREFIX = "Temas disponibles: "
 TOPICS_SEPARATOR = ", "
+SEARCH_POLICY_TOOL = "search_policy"
 
 
 def phrase_pattern(phrase):
@@ -173,3 +174,24 @@ class PolicyBook:
             if policy.topic == found:
                 return policy.text
         return TOPICS_PREFIX + TOPICS_SEPARATOR.join(self.topics())
+
+    def consulted_texts(self, tool_calls):
+        """Textos que devolvió ``search_policy`` en las llamadas de una petición.
+
+        ``search_policy`` es pura: repetir la llamada con los mismos argumentos
+        devuelve el mismo texto que recibió el modelo. Las demás herramientas
+        se ignoran.
+
+        :param tool_calls: Herramientas ejecutadas con sus argumentos
+        :type tool_calls: Iterable[dict]
+        :return: Textos consultados, en orden y sin repetir
+        :rtype: tuple[str, ...]
+        """
+        texts = []
+        for call in tool_calls:
+            if call.get("tool") != SEARCH_POLICY_TOOL:
+                continue
+            text = self.search_policy(**call.get("args", {}))
+            if text not in texts:
+                texts.append(text)
+        return tuple(texts)

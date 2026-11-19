@@ -599,6 +599,7 @@ def create_app(
         tracer=tracer,
         logger=JsonLogger(settings.service_name, clock, log_stream),
         metrics=Metrics(settings.slo_p95_ms),
+        policies=policies,
         answer_cache=_build_answer_cache(settings, clock),
     )
     runtime = _Runtime(

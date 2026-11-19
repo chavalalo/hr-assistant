@@ -34,8 +34,9 @@ from app.metrics import (
 from app.pii import redact
 from app.resilience import run_with_fallback
 from app.reviewer import BLOCK_REASON as REVIEW_BLOCK_REASON
-from app.reviewer import review
-from app.supervisor import RULE_ROUTES
+from app.reviewer import employee_ids, mentions_unknown_employee, review
+from app.specialists import Grounding, ground_policy
+from app.supervisor import POLICY, ROUTE_POLICY, RULE_ROUTES
 from app.tracing import TRACE_REQUEST, agent_trace_name, run_traced
 
 LOCATION_INPUT = "input"
@@ -45,6 +46,7 @@ AGENT_SUPERVISOR = "supervisor"
 AGENT_REVIEWER = "reviewer"
 AGENT_CACHE = "cache"
 AUDIT_ARG_MAX_CHARS = 200
+POLICY_BLOCK_REASON = "ungrounded_policy_number"
 
 
 @dataclass(frozen=True)
@@ -358,6 +360,9 @@ class PipelineDependencies:  # pylint: disable=too-many-instance-attributes
     :type logger: app.logs.JsonLogger
     :param metrics: Métricas del proceso
     :type metrics: app.metrics.Metrics
+    :param policies: Libro de políticas (lo usan el especialista ``policy``
+        y el revisor)
+    :type policies: app.policies.PolicyBook
     :param answer_cache: Caché de respuestas; ``None`` si está apagada
         (``ANSWER_CACHE_TTL_SECONDS=0``)
     :type answer_cache: app.cache.AnswerCache or None
@@ -372,6 +377,7 @@ class PipelineDependencies:  # pylint: disable=too-many-instance-attributes
     tracer: object
     logger: object
     metrics: object
+    policies: object
     answer_cache: object = None
 
 
@@ -452,16 +458,21 @@ class AskPipeline:
         :raises app.gateway.ModelUnavailable: Si ningún modelo contesta
         """
         deps = self._deps
-        settings = deps.settings
         decision = run_traced(
             deps.tracer,
             agent_trace_name(AGENT_SUPERVISOR),
             partial(deps.supervisor.route, guarded.question),
             _decision_summary,
         )
-        route = choose_model(guarded.question, settings)
-        history = trim_history(guarded.history, settings.history_window)
-        messages = history + [{"role": USER_ROLE, "content": guarded.question}]
+        route = choose_model(guarded.question, deps.settings)
+        history = trim_history(guarded.history, deps.settings.history_window)
+        grounding = self._ground(decision, guarded.question)
+        # La política consultada en código va primero, antes del historial.
+        messages = (
+            list(grounding.messages)
+            + history
+            + [{"role": USER_ROLE, "content": guarded.question}]
+        )
         # Desde aquí los runs llevan también el especialista en sus metadatos.
         with deps.tracer.context(
             request_id, client=client, specialist=decision.specialist
@@ -469,6 +480,7 @@ class AskPipeline:
             run = self._run_specialist(
                 deps.specialists[decision.specialist], messages, route.model
             )
+            tool_calls = list(grounding.tool_calls) + list(run.result.tool_calls)
             reviewed = run_traced(
                 deps.tracer,
                 agent_trace_name(AGENT_REVIEWER),
@@ -478,21 +490,22 @@ class AskPipeline:
                     client,
                     run.result.answer,
                     guarded.question,
+                    self._policy_texts(decision, tool_calls),
                 ),
                 _review_summary,
             )
-        input_tokens, output_tokens, cached_calls = _sum_tokens(
+        tokens = _sum_tokens(
             list(decision.completions) + list(run.result.completions)
         )
         return AskOutcome(
             answer=reviewed.answer,
             steps=run.result.steps,
-            tools_used=list(run.result.tools_used),
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            tools_used=grounding.tools_used + list(run.result.tools_used),
+            input_tokens=tokens[0],
+            output_tokens=tokens[1],
             model=run.model,
             route=route.reason,
-            cached_calls=cached_calls,
+            cached_calls=tokens[2],
             cost_usd=self._cost(decision, run),
             specialist=decision.specialist,
             agents=[
@@ -505,10 +518,43 @@ class AskPipeline:
             pii_redacted=sorted(set(guarded.pii_types) | set(reviewed.pii_types)),
             fallback=run.fallback,
             stopped=run.result.stopped,
-            tool_calls=list(run.result.tool_calls),
+            tool_calls=tool_calls,
             history_sent=len(history),
             output_blocked=reviewed.blocked,
         )
+
+    def _ground(self, decision, question):
+        """Consulta en código la política si el supervisor eligió por regla.
+
+        Solo con ``supervisor_route == "rule:policy"``: el modelo recibe el
+        texto de la política antes de su primera llamada.
+
+        :param decision: Decisión del supervisor
+        :type decision: app.supervisor.Decision
+        :param question: Pregunta ya redactada por el guardián
+        :type question: str
+        :return: Mensajes y llamadas de la consulta; vacío si no aplica
+        :rtype: app.specialists.Grounding
+        """
+        if decision.route != ROUTE_POLICY:
+            return Grounding()
+        return ground_policy(self._deps.policies, question)
+
+    def _policy_texts(self, decision, tool_calls):
+        """Textos de políticas que el revisor usa para anclar las cifras.
+
+        :param decision: Decisión del supervisor
+        :type decision: app.supervisor.Decision
+        :param tool_calls: Herramientas de la petición: las de código y las
+            del bucle del especialista
+        :type tool_calls: list[dict]
+        :return: Textos consultados (tupla vacía si no hubo ninguno) para
+            ``policy``; ``None`` para ``directory``
+        :rtype: tuple[str, ...] or None
+        """
+        if decision.specialist != POLICY:
+            return None
+        return self._deps.policies.consulted_texts(tool_calls)
 
     def _cost(self, decision, run):
         """Costo de la pregunta: supervisor (modelo pequeño) más especialista.
@@ -704,13 +750,15 @@ class AskPipeline:
             result=attempt.value, model=attempt.model, fallback=attempt.fallback
         )
 
-    def _review(self, request_id, client, answer, question=""):
+    # pylint: disable-next=too-many-arguments,too-many-positional-arguments
+    def _review(self, request_id, client, answer, question="", policy_texts=None):
         """Revisor de salida.
 
         Redacta la PII de la respuesta, reemplaza las que citan ids
         ``EMP-dddd`` inexistentes que la persona no escribió en su pregunta
-        (ids inventados) y recorta a ``MAX_ANSWER_CHARS``. El ``audit`` lleva
-        solo tipos, conteo y motivo: nunca la respuesta.
+        (ids inventados), ancla las cifras de ``policy`` a los textos
+        consultados y recorta a ``MAX_ANSWER_CHARS``. El ``audit`` lleva solo
+        tipos, conteo y motivo: nunca la respuesta.
 
         :param request_id: Id de la petición
         :type request_id: str
@@ -720,6 +768,9 @@ class AskPipeline:
         :type answer: str
         :param question: Pregunta ya redactada por el guardián
         :type question: str
+        :param policy_texts: Textos de las políticas consultadas; ``None`` si
+            el especialista no es ``policy``
+        :type policy_texts: tuple[str, ...] or None
         :return: Respuesta revisada
         :rtype: ReviewedAnswer
         """
@@ -729,6 +780,7 @@ class AskPipeline:
             deps.directory,
             deps.settings.max_answer_chars,
             question=question,
+            policy_texts=policy_texts,
         )
         self._audit_pii(request_id, client, LOCATION_OUTPUT, result)
         if result.blocked:
@@ -737,7 +789,7 @@ class AskPipeline:
                 request_id,
                 client=client,
                 action="output_blocked",
-                reason=REVIEW_BLOCK_REASON,
+                reason=self._block_reason(answer, question, policy_texts),
             )
             deps.metrics.add_security(OUTPUT_BLOCKED)
         return ReviewedAnswer(
@@ -745,6 +797,28 @@ class AskPipeline:
             pii_types=tuple(result.types),
             blocked=result.blocked,
         )
+
+    def _block_reason(self, answer, question, policy_texts):
+        """Motivo del bloqueo del revisor, para el ``audit``.
+
+        El revisor revisa primero los ids inventados; si no los hay y la
+        respuesta es de ``policy``, el bloqueo fue por una cifra que no está en
+        las políticas consultadas.
+
+        :param answer: Respuesta del especialista
+        :type answer: str
+        :param question: Pregunta ya redactada por el guardián
+        :type question: str
+        :param policy_texts: Textos de las políticas consultadas o ``None``
+        :type policy_texts: tuple[str, ...] or None
+        :return: ``unknown_employee_id`` o ``ungrounded_policy_number``
+        :rtype: str
+        """
+        if policy_texts is None or mentions_unknown_employee(
+            redact(answer).text, self._deps.directory, employee_ids(question)
+        ):
+            return REVIEW_BLOCK_REASON
+        return POLICY_BLOCK_REASON
 
     def _record(self, request_id, client, payload, outcome):
         """Escribe ``audit`` por herramienta y ``agent_run``; suma métricas.

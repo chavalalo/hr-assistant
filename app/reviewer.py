@@ -4,9 +4,12 @@ En este orden: oculta la PII de la respuesta; si menciona un id ``EMP-dddd``
 que no existe en el directorio y que la persona no escribió en su pregunta (un
 id inventado por el modelo), la reemplaza por un mensaje fijo; al final la
 recorta a ``MAX_ANSWER_CHARS``. Los ids se comparan sin distinguir
-mayúsculas. Nunca escribe el texto que revisa.
+mayúsculas. Con ``policy_texts`` (respuestas de ``policy``), cada cifra
+de la respuesta debe estar en los textos de las políticas consultadas.
+Nunca escribe el texto que revisa.
 """
 
+import re
 from dataclasses import dataclass
 
 from app.directory import EMPLOYEE_ID_PATTERN
@@ -15,7 +18,11 @@ from app.pii import redact
 UNVERIFIED_ANSWER = (
     "No pude verificar la respuesta con el directorio. Intenta de nuevo."
 )
+UNVERIFIED_POLICY_ANSWER = (
+    "No pude verificar la respuesta con las políticas. Intenta de nuevo."
+)
 BLOCK_REASON = "unknown_employee_id"
+NUMBER_PATTERN = re.compile(r"\d+")
 
 
 @dataclass(frozen=True)
@@ -72,7 +79,45 @@ def mentions_unknown_employee(text, directory, asked_ids=frozenset()):
     )
 
 
-def review(answer, directory, max_chars, question=""):
+def numbers(text):
+    """Extrae las cifras completas de un texto.
+
+    Se comparan cifras enteras, no subcadenas: «5» no está en «15».
+
+    :param text: Texto donde buscar
+    :type text: str
+    :return: Cifras encontradas, sin repetir
+    :rtype: frozenset[str]
+    """
+    return frozenset(NUMBER_PATTERN.findall(text))
+
+
+def ground_in_policies(text, policy_texts):
+    """Ancla la respuesta a los textos de las políticas consultadas.
+
+    Si alguna cifra de la respuesta no aparece en los textos, la respuesta se
+    reemplaza por el primer texto; si no hay textos y la respuesta trae
+    cifras, se reemplaza por un mensaje fijo.
+
+    :param text: Respuesta ya redactada
+    :type text: str
+    :param policy_texts: Textos de las políticas consultadas en la petición
+    :type policy_texts: tuple[str, ...]
+    :return: Respuesta final y si se reemplazó
+    :rtype: tuple[str, bool]
+    """
+    answer_numbers = numbers(text)
+    if not answer_numbers:
+        return text, False
+    if not policy_texts:
+        return UNVERIFIED_POLICY_ANSWER, True
+    policy_numbers = frozenset().union(*(numbers(item) for item in policy_texts))
+    if answer_numbers <= policy_numbers:
+        return text, False
+    return policy_texts[0], True
+
+
+def review(answer, directory, max_chars, question="", policy_texts=None):
     """Revisa la respuesta del especialista antes de mandarla.
 
     :param answer: Respuesta del especialista
@@ -84,6 +129,10 @@ def review(answer, directory, max_chars, question=""):
     :param question: Pregunta de la persona, ya redactada por el guardián;
         sus ids ``EMP-dddd`` no cuentan como inventados
     :type question: str
+    :param policy_texts: Textos de las políticas consultadas; ``None`` si la
+        respuesta no es del especialista ``policy`` y la regla de cifras no
+        aplica
+    :type policy_texts: tuple[str, ...] | None
     :return: Respuesta revisada
     :rtype: Review
     """
@@ -92,6 +141,8 @@ def review(answer, directory, max_chars, question=""):
         cleaned.text, directory, employee_ids(question)
     )
     text = UNVERIFIED_ANSWER if blocked else cleaned.text
+    if not blocked and policy_texts is not None:
+        text, blocked = ground_in_policies(text, tuple(policy_texts))
     return Review(
         answer=text[:max_chars],
         types=cleaned.types,
